@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Shoko.VFS.FUSE.Host</RootNamespace>
+    <AssemblyName>Shoko.VFS.FUSE.Host</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.10" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Shoko.VFS.FUSE\Shoko.VFS.FUSE.csproj" />
+    <ProjectReference Include="..\..\ShokoServer\Shoko.Abstractions\Shoko.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>

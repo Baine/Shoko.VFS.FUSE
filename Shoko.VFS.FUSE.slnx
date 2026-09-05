@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Shoko.VFS.FUSE.Tests/Shoko.VFS.FUSE.Tests.csproj" />
+  <Project Path="Shoko.VFS.FUSE.Host/Shoko.VFS.FUSE.Host.csproj" />
+  <Project Path="Shoko.VFS.FUSE/Shoko.VFS.FUSE.csproj" />
+</Solution>

@@ -1,0 +1,67 @@
+{
+  // Shoko VFS FUSE Host Daemon Configuration
+  // Path: --config flag or ~/.config/shoko-vfs-fuse/config.json
+  //
+  // Environment variable overrides (when --config is not specified):
+  //   SHOKO_URL, SHOKO_USER, SHOKO_PASS, SHOKO_API_KEY
+  //
+  // Fields are documented in HostConfig.cs; defaults are shown below.
+
+  // -- Connection --
+  "ShokoUrl": "http://localhost:8888",
+  "ShokoUser": "admin",
+  "ShokoPass": "admin",
+  // "ShokoApiKey": "",  // Pre-existing key; bypasses login
+
+  // -- Relay settings --
+  "RelayEnabled": true,
+  "RelayTvFolderName": "!ShokoRelayVFS",
+  "RelayMovieFolderName": "!ShokoRelayMovieVFS",
+  "MovieGenerationMode": 0,
+  "TmdbEpNumbering": true,
+  "MergeTmdbSeries": false,
+  "PlexLocalExtras": true,
+  "FolderExclusions": "",
+  "ManagedFolderExclusions": "",
+  "SeriesTitleLanguage": "SHOKO",
+  "EpisodeTitleLanguage": "SHOKO",
+  "MoveCommonSeriesTitlePrefixes": true,
+  "TmdbEpGroupNames": true,
+
+  // -- FUSE --
+  "FuseAllowOther": true,
+  "FuseMountUid": 99,
+  "FuseMountGid": 100,
+  "AttrTimeout": 2.0,
+  "EntryTimeout": 2.0,
+  "NegativeTimeout": 0.5,
+
+  // -- Host path mapping (Unraid example) --
+  // Maps server-side /mnt/array/* to Unraid's /mnt/user/array/* so
+  // the FUSE mounts appear under /mnt/user/array/.../!ShokoRelayVFS.
+  // Leave both empty for identity mapping (no path translation).
+  "ServerPathRoot": "/mnt/array",
+  "ManagedFolderPathRoot": "/mnt/user/array",
+
+  // -- Health --
+  "HealthPort": 8790,
+
+  // -- Reconcile --
+  "ReconcileInterval": "300s",
+  "ContentDirtyCooldown": "5s",
+  "TopologyDirtyCooldown": "5s",
+  "ServerStartupTimeout": "120s",
+
+  // -- Cache --
+  "AggregationCacheTtl": "30s",
+  "AggregationFetchDegree": 4,
+  "SnapshotCacheDir": null,
+  "CacheFreezeOnOutage": true,
+  "ServerPollInterval": "5s",
+  "MaxServerProbeFailures": 3,
+  "HttpRetries": 2,
+
+  // -- Validation --
+  "PathValidationSamples": 5,
+  "PathValidationMaxPathLength": 500
+}

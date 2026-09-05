@@ -1,0 +1,41 @@
+# Build results
+bin/
+obj/
+*.user
+*.suo
+*.userprefs
+*.sln.docstates
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+
+# Test results
+TestResults/
+coverage/
+
+# Release artifacts and temporary package staging
+artifacts/
+.package/
+
+# Deepwork (local session state)
+.slim/deepwork/
+
+# Local secrets and config (never commit)
+.env
+.env.*
+*.local.json
+config.local.json

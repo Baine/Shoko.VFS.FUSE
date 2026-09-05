@@ -1,0 +1,41 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <PluginId>c6b59b26-9fd1-4220-ab6d-0b2d92e19022</PluginId>
+    <PackageId>$(PluginId)</PackageId>
+    <Title>Shoko.VFS.FUSE</Title>
+    <Description>Linux FUSE virtual filesystem plugin for Shoko.</Description>
+    <PackageTags>linux;fuse;vfs;shoko</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\ShokoServer\Shoko.Abstractions\Shoko.Abstractions.csproj">
+      <Private>false</Private>
+      <PrivateAssets>all</PrivateAssets>
+    </ProjectReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LTRData.FuseDotNet" Version="1.0.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="PackageID" Value="$(PluginId)" />
+    <AssemblyMetadata Include="PackageName" Value="Shoko.VFS.FUSE" />
+    <AssemblyMetadata Include="PackageOverview" Value="Linux FUSE virtual filesystem plugin for Shoko." />
+    <AssemblyMetadata Include="PackageTags" Value="linux,fuse,vfs,shoko" />
+    <AssemblyMetadata Include="RuntimeIdentifier" Value="$(RuntimeIdentifier)" Condition="'$(RuntimeIdentifier)' != ''" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Shoko.VFS.FUSE.Tests" />
+    <InternalsVisibleTo Include="Shoko.VFS.FUSE.Host" />
+  </ItemGroup>
+
+</Project>
