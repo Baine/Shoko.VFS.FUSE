@@ -46,11 +46,13 @@ public sealed class HealthEndpoint : IDisposable
         try
         {
             _listener.Start();
-            _logger.LogInformation("Health endpoint listening on http://127.0.0.1/{Port}/", _listener.Prefixes.FirstOrDefault()?.Split('/')[2] ?? "?");
+            var prefix = _listener.Prefixes.FirstOrDefault() ?? "?";
+            _logger.LogInformation("Health endpoint listening on {Prefix}", prefix);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Health endpoint failed to start on port {_Port}; health checks disabled", _listener.Prefixes.FirstOrDefault()?.Split('/')[2] ?? "?");
+            var prefix = _listener.Prefixes.FirstOrDefault() ?? "?";
+            _logger.LogWarning(ex, "Health endpoint failed to start on {Prefix}; health checks disabled", prefix);
         }
     }
 
