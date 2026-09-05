@@ -160,6 +160,39 @@ pre-flight check after any config/environment change:
     --dry-run --config /boot/config/plugins/shoko-vfs-fuse/config.json
 ```
 
+## Warmup (cache pre-prime)
+
+For large libraries (1k+ series), the first aggregation can take 15–45 minutes
+during which the daemon serves an empty cache. Run `--warmup` once to prime the
+per-mount snapshot files + clean-shutdown marker; subsequent daemon starts load
+the warm snapshot and skip the cold aggregation.
+
+```sh
+/boot/config/plugins/shoko-vfs-fuse/start-shoko-vfs-fuse.sh warmup
+# ...waits 15–45 min...
+# Warmup complete; per-mount snapshots + clean-shutdown marker persisted.
+# Next normal daemon start will load the snapshot and skip the cold aggregation.
+
+/boot/config/plugins/shoko-vfs-fuse/start-shoko-vfs-fuse.sh start
+# → near-instant start; FUSE mount serves the loaded snapshot immediately.
+```
+
+To chain warmup + start in one command (blocks until warmup finishes):
+
+```sh
+WARMUP_BEFORE_START=1 /boot/config/plugins/shoko-vfs-fuse/start-shoko-vfs-fuse.sh start
+```
+
+For periodic refresh (e.g. after large imports), schedule as a systemd timer or
+cron job that runs the `warmup` action on a cadence. The action is idempotent —
+re-running it overwrites the snapshot files with the freshest aggregation.
+See `BENCHMARKS.md` for the per-library-size timing estimates.
+
+`--warmup` requires the FUSE mountpoints to exist as regular directories (it
+briefly mounts then unmounts each managed folder during the reconcile step).
+If you changed `ServerPathRoot` / `ManagedFolderPathRoot` since the last run,
+ensure the target directories exist before warmup.
+
 ## Adapting for non-Unraid hosts
 
 The guide is Unraid-specific in four ways; adapt for other systems:

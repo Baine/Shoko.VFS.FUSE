@@ -13,10 +13,13 @@
 # resolved relative to this script's own directory.
 #
 # Environment overrides:
-#   BIN       Path to the daemon binary
-#   CONFIG    Path to config.json
-#   LOGDIR    Directory for daemon.log
-#   PIDFILE   PID file path
+#   BIN                  Path to the daemon binary
+#   CONFIG               Path to config.json
+#   LOGDIR               Directory for daemon.log
+#   PIDFILE              PID file path
+#   WARMUP_BEFORE_START  If set to 1, run --warmup before launching the
+#                        daemon in the start action. Blocks until warmup
+#                        completes (15–45 min for a large library).
 #
 # Connection via environment is supported when CONFIG does not exist:
 #   SHOKO_URL
@@ -25,13 +28,25 @@
 #   SHOKO_API_KEY
 #
 # Usage:
-#   ./start-shoko-vfs-fuse.sh [start|stop|restart|status|foreground]
+#   ./start-shoko-vfs-fuse.sh [start|stop|restart|status|foreground|warmup]
 #   ./start-shoko-vfs-fuse.sh --help
 #   ./start-shoko-vfs-fuse.sh --version
+#
+# Warmup:
+#   ./start-shoko-vfs-fuse.sh warmup
+#       Runs --warmup once: connects to Shoko, performs the full startup
+#       reconcile, persists per-mount snapshots + clean-shutdown marker,
+#       exits. After warmup the daemon's start action is near-instant
+#       (loads the warm snapshot, skips cold aggregation).
+#
+#   WARMUP_BEFORE_START=1 ./start-shoko-vfs-fuse.sh start
+#       Runs warmup synchronously, then launches the daemon. Useful for
+#       fresh installs where the daemon should not serve an empty cache
+#       during the first reconcile.
 
 set -eu
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 SCRIPT_DIR=$(
     CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null
@@ -55,9 +70,20 @@ usage() {
 start-shoko-vfs-fuse.sh v${VERSION}
 
 Usage:
-  $0 [start|stop|restart|status|foreground]
+  $0 [start|stop|restart|status|foreground|warmup]
   $0 --help
   $0 --version
+
+Actions:
+  start       Launch the daemon in the background (default).
+  stop        Stop the running daemon.
+  restart     Stop + start.
+  status      Print whether the daemon is running.
+  foreground  Run the daemon in the foreground (Ctrl-C to stop).
+  warmup      One-shot: connect to Shoko, run the full startup reconcile,
+              persist per-mount snapshots + clean-shutdown marker, exit.
+              Subsequent start actions load the warm snapshot and skip
+              the cold aggregation. Safe to run repeatedly; idempotent.
 
 Defaults:
   Script dir: $SCRIPT_DIR
@@ -71,6 +97,9 @@ Environment overrides:
   CONFIG
   LOGDIR
   PIDFILE
+  WARMUP_BEFORE_START  Set to 1 to run the warmup action automatically
+                       before launching the daemon in the start action.
+                       Blocks for the duration of the cold aggregation.
 
 If CONFIG does not exist, connection settings may be supplied via:
   SHOKO_URL
@@ -89,6 +118,10 @@ Examples:
   SHOKO_API_KEY=... \
   CONFIG=/nonexistent \
   $0 start
+
+  $0 warmup                                 # one-shot cache prime
+  WARMUP_BEFORE_START=1 $0 start            # warmup + start, blocking
+  WARMUP_BEFORE_START=1 $0 restart          # stop, warmup, start
 EOF
 }
 
@@ -222,6 +255,15 @@ start_daemon() {
 
     export_connection_env
 
+    if [ "${WARMUP_BEFORE_START:-0}" = "1" ]; then
+        log "WARMUP_BEFORE_START=1: running --warmup before launching the daemon."
+        log "This blocks for the duration of the cold aggregation (15–45 min for a large library)."
+        warmup_daemon || {
+            log "ERROR: warmup failed; not starting daemon." >&2
+            exit 1
+        }
+    fi
+
     log "Starting Shoko VFS FUSE host daemon..."
     log "  Binary: $BIN"
 
@@ -273,6 +315,21 @@ foreground_daemon() {
     fi
 }
 
+warmup_daemon() {
+    validate_binary
+    validate_connection
+    ensure_fuse_conf
+    export_connection_env
+
+    if [ -f "$CONFIG" ]; then
+        log "Running one-shot warmup with config: $CONFIG"
+        "$BIN" --warmup --config "$CONFIG"
+    else
+        log "Running one-shot warmup using environment."
+        "$BIN" --warmup
+    fi
+}
+
 status_daemon() {
     remove_stale_pidfile
 
@@ -305,6 +362,9 @@ case "$ACTION" in
         ;;
     foreground)
         foreground_daemon
+        ;;
+    warmup)
+        warmup_daemon
         ;;
     --help|-h|help)
         usage
