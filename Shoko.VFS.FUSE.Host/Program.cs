@@ -3,6 +3,7 @@
 // Usage:
 //   dotnet run --project Shoko.VFS.FUSE.Host -- --selftest            (self-check, no server)
 //   dotnet run --project Shoko.VFS.FUSE.Host -- --dry-run             (print mount plan, do not mount)
+//   dotnet run --project Shoko.VFS.FUSE.Host -- --warmup              (prime cache + persist snapshots, exit)
 //   SHOKO_URL=... SHOKO_USER=... SHOKO_PASS=... \
 //       dotnet run --project Shoko.VFS.FUSE.Host                      (run the daemon)
 //   ... --config <path>                                               (JSON config file)
@@ -28,6 +29,9 @@ if (args.Contains("--selftest"))
 
 if (args.Contains("--dry-run"))
     return await RunDryRunAsync(args).ConfigureAwait(false);
+
+if (args.Contains("--warmup"))
+    return await RunWarmupAsync(args).ConfigureAwait(false);
 
 if (args.Contains("--agg"))
     return await AggregateCheck.RunAsync(args).ConfigureAwait(false);
@@ -98,6 +102,71 @@ static async Task<int> RunDryRunAsync(string[] args)
     {
         Console.Error.WriteLine("--dry-run failed: " + ex.Message);
         return 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Warmup: connect, login, start SignalR + availability monitor, load any
+// persisted snapshot, run the full startup reconcile, persist snapshots +
+// clean-shutdown marker, exit. Useful as a pre-deploy cache prime or a
+// scheduled refresh that does not keep the daemon process alive.
+// ---------------------------------------------------------------------------
+static async Task<int> RunWarmupAsync(string[] args)
+{
+    var config = TryLoadConfig(args);
+    if (string.IsNullOrWhiteSpace(config.ShokoUrl))
+    {
+        Console.Error.WriteLine("--warmup requires SHOKO_URL (and SHOKO_USER / SHOKO_PASS or SHOKO_API_KEY).");
+        return 1;
+    }
+
+    ProbeFuseConf(config);
+
+    using var loggerFactory = LoggerFactory.Create(builder =>
+    {
+        builder.AddSimpleConsole(options =>
+        {
+            options.SingleLine = true;
+            options.TimestampFormat = "HH:mm:ss ";
+        });
+        builder.SetMinimumLevel(LogLevel.Information);
+    });
+    var tracker = new DaemonStateTracker();
+    var daemon = new DaemonOrchestrator(config, tracker, loggerFactory);
+
+    using var cts = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        cts.Cancel();
+    };
+
+    try
+    {
+        await daemon.WarmupAsync(cts.Token).ConfigureAwait(false);
+        Console.WriteLine("Warmup complete; per-mount snapshots + clean-shutdown marker persisted.");
+        Console.WriteLine("Next normal daemon start will load the snapshot and skip the cold aggregation.");
+        return 0;
+    }
+    catch (OperationCanceledException)
+    {
+        Console.Error.WriteLine("Warmup cancelled.");
+        return 1;
+    }
+    catch (TimeoutException ex)
+    {
+        Console.Error.WriteLine("Warmup failed: " + ex.Message);
+        return 1;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine("Warmup failed: " + ex.Message);
+        return 1;
+    }
+    finally
+    {
+        // DisposeAsync flushes per-mount snapshots + clean-shutdown marker.
+        await daemon.DisposeAsync().ConfigureAwait(false);
     }
 }
 

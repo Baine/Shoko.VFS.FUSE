@@ -107,6 +107,52 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
         _state.State = DaemonState.WaitingForServer;
         _logger.LogInformation("Waiting for Shoko server at {Url}", _config.ShokoUrl);
 
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        // Periodic safety reconcile.
+        _safetyLoop = RunSafetyLoopAsync(ct);
+
+        // Run until cancelled.
+        try
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown.
+        }
+    }
+
+    /// <summary>
+    /// One-shot warmup: connects to Shoko, performs the full startup reconcile, and
+    /// returns. <see cref="StopAsync"/> / <see cref="DisposeAsync"/> flush the per-mount
+    /// snapshots + clean-shutdown marker so a subsequent normal <see cref="RunAsync"/>
+    /// starts hot. Useful as a pre-deploy cache prime, or as a periodic refresh that
+    /// does not require keeping the daemon process alive.
+    ///
+    /// The full reconcile (and therefore FUSE mount creation for each lease) still runs —
+    /// the cache lives in the lease data source, so mounting is part of warming it.
+    /// The leases are torn down on <see cref="DisposeAsync"/>.
+    /// </summary>
+    public async Task WarmupAsync(CancellationToken ct)
+    {
+        _state.State = DaemonState.WaitingForServer;
+        _logger.LogInformation("Warmup: connecting to {Url}", _config.ShokoUrl);
+
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "Warmup: complete. Disposing orchestrator will persist per-mount snapshots + clean-shutdown marker.");
+    }
+
+    /// <summary>
+    /// Shared startup path: wait for server, login, start SignalR + availability monitor,
+    /// clean stale mounts, load persisted snapshots, run the startup reconcile. Used by
+    /// both <see cref="RunAsync"/> (which continues with the safety loop) and
+    /// <see cref="WarmupAsync"/> (which returns immediately after this returns).
+    /// </summary>
+    private async Task InitializeAsync(CancellationToken ct)
+    {
         // 1. Wait for the server to become reachable.
         if (!await WaitForServerAsync(ct).ConfigureAwait(false))
             throw new TimeoutException(
@@ -130,19 +176,6 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
 
         // 6. Startup reconcile (uses the loaded snapshot if available; rebuilds otherwise).
         await ReconcileAsync().ConfigureAwait(false);
-
-        // 7. Periodic safety reconcile.
-        _safetyLoop = RunSafetyLoopAsync(ct);
-
-        // 8. Run until cancelled.
-        try
-        {
-            await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            // Normal shutdown.
-        }
     }
 
     private async Task<bool> WaitForServerAsync(CancellationToken ct)

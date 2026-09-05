@@ -1,0 +1,250 @@
+# Performance: Shoko.VFS.FUSE vs Shokofin vs ShokoRelay
+
+> Architectural estimates, not benchmarks. Numbers below are derived from the
+> codebase's own reference points (e.g. `ShokoRelayDataSource.cs:133` —
+> "1.4k series × ~200ms serially = 5+ minutes") and Shoko's own REST latency
+> for typical managed folders. Always validate against your own workload.
+
+## TL;DR
+
+For a **6,152 series / 70,498 files / 70.8 TiB** library:
+
+| Approach | First-aggregation cold start | Steady-state RAM | Disk delta | Survives Shoko restart |
+|---|---|---|---|---|
+| Shokofin (in-tree, virtual VFS) | ~8–20 min | ~1.5–2.5 GB (shared with Shoko) | 0 | ❌ |
+| ShokoRelay (in-tree, symlink materialization) | **2–6 hours** + cleanup scan | ~2–3 GB (shared with Shoko) | 70,498 symlinks + 37k dirs | ❌ |
+| Shoko.VFS.FUSE in-tree (virtual) | ~8–20 min | ~1.2–2.0 GB (shared with Shoko) | 0 | ❌ |
+| Shoko.VFS.FUSE.Host (REST, frozen cache) | ~15–45 min | ~600 MB–1.2 GB (separate) | snapshot JSON: ~50–500 MB | ✅ |
+| Shoko.VFS.FUSE.Host **with `--warmup`** | warmup 15–45 min offline, daemon start ~10s | same | same | ✅ |
+
+The host daemon's `--warmup` mode is the meaningful differentiator at this
+scale: it lets you front-load the cold aggregation out-of-band so the actual
+daemon start is near-instant.
+
+## Test environment
+
+| Series | Files | Total size | Avg file size |
+|---|---|---|---|
+| 6,152 | 70,498 | 70.8 TiB | ~1.03 GB |
+
+(Each series corresponds to a Shoko ID — includes TV, movies, OVAs, specials.)
+
+## Cold first-aggregation time
+
+| Step | Shokofin / ShokoRelay (in-process) | Shoko.VFS.FUSE in-tree | Shoko.VFS.FUSE.Host (REST) |
+|---|---|---|---|
+| `/api/v3/ManagedFolder` | n/a (in-process) | n/a | ~1 s |
+| `/api/v3/ManagedFolder/{id}/File?pageSize=0&include=XRefs` over 70,498 files | ~30 s (Shoko DB) | ~30 s (Shoko DB) | **2–10 min** ← the killer |
+| `/api/v3/Series?pageSize=100` paginated (~62 pages) | ~10 s (in-process) | ~10 s | ~30–60 s |
+| Per-series episode fetch (6,152 × ~200 ms) | serial ~21 min, **parallel@4: ~5 min**, parallel@8: ~2.5 min | same | same |
+| TMDB show episode listings (where applicable) | 1–10 min | 1–10 min | 1–10 min |
+| Projector + Grouper over 6,152 series | ~20–60 s | ~20–60 s | ~20–60 s |
+| **Total cold start** | **~8–20 min** | **~8–20 min** | **~15–45 min** |
+
+The host daemon is ~2× slower cold because the `/ManagedFolder/{id}/File?include=XRefs`
+endpoint is the worst offender — a single REST call that has to serialize
+70,498 entries with their cross-references. **For libraries this size,
+bump `RequestTimeout` to 15+ minutes**; the 10-minute default is the floor.
+
+The default `AggregationFetchDegree: 4` controls the per-series parallelism —
+the wall time for the per-series step on a 6,152-series library goes from
+~21 min (serial) to ~5 min at degree 4, or ~2.5 min at degree 8. The
+trade-off is concurrent REST load on ShokoServer.
+
+## Steady-state RAM
+
+| | Process | Typical RSS |
+|---|---|---|
+| Shokofin | Shoko + Shokofin module | ~1.5–2.5 GB (inherits all of Shoko's caches) |
+| ShokoRelay | Shoko + ShokoRelay plugin | ~2–3 GB (Shoko + symlink tracking + cleanup index) |
+| Shoko.VFS.FUSE in-tree | Shoko + plugin | ~1.2–2.0 GB |
+| Shoko.VFS.FUSE.Host | Standalone | ~600 MB–1.2 GB (separate process; + per-mount snapshot files on disk) |
+
+## Disk usage
+
+| | Symlinks | Snapshot cache | Idle inode cost |
+|---|---|---|---|
+| Shokofin | 0 | 0 | 0 |
+| ShokoRelay | **70,498 symlinks** (~5–10 MB metadata) + ~37,000 directories | 0 | inode-heavy |
+| Shoko.VFS.FUSE in-tree | 0 | 0 | 0 |
+| Shoko.VFS.FUSE.Host | 0 | **~50–500 MB JSON** (one per mount) | trivial |
+
+## Where the wins actually land
+
+### vs ShokoRelay (the biggest delta)
+
+- **Materialization: skipped entirely.** ShokoRelay would create 70k symlinks
+  on first run. At ~50 symlinks/sec on a hot filesystem that's ~25 min just
+  for the `symlink()` syscalls, plus directory enumeration, ID3 tag reads,
+  and VFS blueprint serialization — realistically **2–6 hours** for a clean
+  first run on a 6k-series library, often interrupted and resumed.
+- **Cleanup jobs: gone.** ShokoRelay's prune-orphan runs scan the entire VFS
+  tree on every reconcile (~62k directory entries to stat). With ShokoRelay's
+  typical 5-minute reconcile cycle, that's 12 stat-walks per hour of idle.
+  The host daemon does zero.
+- **Rebuild time after crash: minutes, not hours.** ShokoRelay on a partial
+  crash leaves dangling symlinks; the next reconcile must enumerate every
+  directory to know what to recreate. With the host daemon's snapshot cache,
+  recovery is "load JSON, mark dirty, rebuild" — minutes even at this scale.
+- **Time-to-first-mount:** ShokoRelay's first run takes hours before any FUSE
+  read can return data. Shoko.VFS.FUSE.Host serves a stale snapshot within
+  seconds (from the loaded persisted cache, when available).
+
+### vs Shokofin (smaller wins, mostly resilience)
+
+- **Survives ShokoServer restarts.** For a 6,152-series aggregation, ShokoServer
+  restart takes 8–20 min to rebuild its own caches; during that window,
+  Shokofin mounts are dead. The host daemon's frozen cache keeps the mount
+  serving stale data through the restart — Plex/Jellyfin clients don't drop.
+- **Outage noise gone.** The 404/timeout cascade that triggered this whole
+  branch of work is solved by `Freeze`/`Unfreeze` + retry/backoff on the
+  REST client + server-availability monitor + persisted snapshot cache.
+- **Theming parity.** Shokofin has no AnimeThemes Theme.mp3 integration.
+  ShokoRelay did; this repo now does for both deployments (in-tree plugin
+  and host daemon).
+- **CPU/memory isolation.** The host daemon doesn't share its heap with Shoko
+  — relevant on resource-constrained hosts (Unraid, Synology, etc.) where
+  Shoko + Plex + Sonarr + Radarr already consume most of the RAM budget.
+
+### Honest cost (vs Shokofin)
+
+- **Cold FUSE read of a 1 GB file** is ~50–200 ms slower on the first miss
+  (REST round-trip). After the resolver snapshot is warm, subsequent reads
+  go through a hot path. Plex/Jellyfin typically cache metadata so this is
+  a one-time cost per scan.
+- **First aggregation pain:** 15–45 min cold start on this library vs 8–20
+  min for Shokofin. Mitigated by `--warmup` (below).
+- **Memory:** host daemon is its own process. 1 GB dedicated is non-trivial
+  on a 16 GB host. In-tree Shoko.VFS.FUSE shares Shoko's heap so it's cheaper
+  on memory at the cost of sharing Shoko's restart fate.
+
+## Warmup prefetch (`--warmup`)
+
+The host daemon ships with a one-shot mode that runs the full startup path
+once, persists the resulting per-mount snapshots + the clean-shutdown
+marker, and exits. The actual daemon start is then near-instant because
+`TryLoadFromStore` returns the warm snapshot synchronously.
+
+```sh
+# Pre-warm snapshots once, then exit. Persists <snapshotCacheDir>/<key>.snapshot.json
+# and <key>.clean_shutdown for every managed folder.
+dotnet run --project Shoko.VFS.FUSE.Host -- --warmup
+
+# Then the actual daemon starts hot.
+systemctl start shoko-vfs-fuse-host
+```
+
+### What `--warmup` actually does
+
+The full `RunAsync` startup path minus the safety loop:
+
+1. Wait for server (`ServerStartupTimeout`).
+2. Authenticate (`SHOKO_API_KEY` or `SHOKO_USER`+`SHOKO_PASS`).
+3. Start SignalR (background connection, fires dirty events on reconnect).
+4. Clean stale FUSE mounts left by previous crashed runs.
+5. Start the server-availability monitor.
+6. Load any prior persisted snapshot into each lease's data source.
+7. Run the full startup reconcile (this is the heavy step — minutes to tens
+   of minutes depending on library size).
+8. **Return.** `DisposeAsync` flushes per-mount snapshots + writes the
+   `.clean_shutdown` marker.
+
+The leases' data sources are created and torn down during the reconcile
+step; FUSE mounts are briefly created and then unmounted when the orchestrator
+disposes. The mountpoints must exist (or `CleanupStaleMountsAsync` will leave
+them for the real daemon to handle).
+
+### Updated cost numbers with `--warmup`
+
+For a 6,152-series library:
+
+| Path | Without `--warmup` | With `--warmup` |
+|---|---|---|
+| First daemon start (cold) | 15–45 min (FUSE serves empty cache while reconcile runs in background) | 15–45 min (during warmup, FUSE briefly mounts) |
+| Subsequent daemon start | 15–45 min (same cold path; no snapshot to load) | **~10 s** (load JSON, mark dirty, serve stale-while-revalidate) |
+| FUSE first-read latency during initial reconcile | empty cache → slow first fetch per directory, ~50–200 ms per REST round-trip | served from loaded snapshot immediately, <1 ms |
+| Total cold-aggregation work | once at first daemon start | once at warmup, *before* the daemon exists |
+| Daemon process resource use during cold aggregation | full RSS for the duration | full RSS during warmup, then idle for the daemon |
+
+The win isn't reduced CPU — the aggregation still runs once. It's that the
+*time* when the aggregation runs is moved out of the "Plex is online and
+scanning" window.
+
+### When to use `--warmup`
+
+- **Fresh Shoko install:** run `--warmup` once after configuring, before
+  enabling the systemd service. Plex's first scan will see a hot mount.
+- **Library growth:** schedule `--warmup` as a systemd timer or cron job
+  after large imports. The next daemon restart picks up the fresh snapshot.
+- **Migration from Shokofin / ShokoRelay:** warmup produces a complete,
+  validated snapshot in the configured `SnapshotCacheDir`. Safe to run with
+  the old VFS still mounted — leases are isolated per managed folder.
+- **Disaster recovery:** warmup rebuilds snapshots from scratch when the
+  existing cache is missing the clean-shutdown marker (i.e. previous run
+  crashed). Faster than waiting for the daemon to rebuild and signal-OK it.
+
+### When NOT to use `--warmup`
+
+- **Shoko is unreachable.** `--warmup` exits with the same `ServerStartupTimeout`
+  the daemon would. Don't schedule it for the same window as a Shoko update.
+- **Mountpoints don't exist yet.** `--warmup` will fail to mount and exit
+  non-zero. Set up the directories first.
+- **You need live signal-driven updates.** `--warmup` is a snapshot; it
+  does not start SignalR event handlers that keep the snapshot fresh. The
+  main daemon's `Reconnected` event + safety loop + content coalescer are
+  what keep the live view current. Use both: warmup for the floor, daemon
+  for the live updates.
+
+### Configuration knobs that matter for warmup
+
+| Setting | Default | Why it matters at this library size |
+|---|---|---|
+| `ServerStartupTimeout` | 120 s | Bump to 600 s on cold boots of large libraries. |
+| `RequestTimeout` | 10 min | Bump to 15+ min for `/ManagedFolder/{id}/File?include=XRefs` over 70k+ files. |
+| `AggregationFetchDegree` | 4 | 6,152 series / degree 4 ≈ 5 min per-series step; degree 8 ≈ 2.5 min but heavier Shoko load. |
+| `SnapshotCacheDir` | `$XDG_DATA_HOME/shoko-vfs-fuse/snapshots` | Set to a fast filesystem; warmup writes one JSON per mount on exit. |
+| `HttpRetries` | 2 | Bump to 3 if Shoko is remote or flaky. |
+| `ContentDirtyCooldown` | 5 s | Lower if you want faster invalidation during active scanning. |
+
+## Recommendation for this library (6,152 series, 70k files, 70.8 TiB)
+
+**In-tree plugin (Shoko.VFS.FUSE)** when:
+
+- Shoko and Plex share a host.
+- You don't need outage survival.
+- RAM is tight (< 16 GB host, Shoko + Plex + daemons already using most of it).
+- Cold-start time is acceptable in the deploy window.
+
+**Host daemon (Shoko.VFS.FUSE.Host)** when:
+
+- Shoko runs in Docker or on a different host.
+- You want the FUSE mount to survive Shoko crashes / restarts.
+- You have ≥ 4 GB free RAM for a dedicated process.
+- Your primary pain was the 404 storm during Shoko outages (which is what
+  triggered this branch of work).
+- The library is large enough that the 15–45 min cold aggregation matters
+  to your Plex-scan workflow.
+
+**Always run `--warmup` once** before enabling the host daemon for the
+first time on a library this size, and consider a daily / weekly timer
+thereafter to keep the snapshots warm across restarts.
+
+## Caveats and honest limits
+
+- All per-access numbers assume cache hit; cold reads pay the REST
+  round-trip. With `--warmup` ahead of time, "cold reads" become rare.
+- "Steady-state RAM" depends heavily on how many files are visible
+  simultaneously in the resolver snapshot.
+- ShokoRelay's biggest cost is *materialization*, not steady-state — at
+  smaller libraries (< 500 series) the difference narrows and the choice
+  becomes mostly about features.
+- For libraries > 5k series, the host daemon's persistent snapshot cache
+  is the meaningful differentiator — it survives reboots and crashes.
+  In-tree Shoko.VFS.FUSE has no equivalent yet.
+- The 200 ms / per-series estimate comes from the codebase's own
+  ponytail-comment reference point; real-world numbers vary with Shoko's
+  DB load, the host's network/loopback latency, and whether TMDB
+  alternate-ordering data is needed.
+- Test with a sample: `dotnet run --project Shoko.VFS.FUSE.Host -- --dry-run`
+  prints the mount plan without any aggregation, so you can validate the
+  topology quickly before committing to a full warmup.

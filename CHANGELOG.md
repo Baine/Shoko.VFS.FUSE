@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added — host daemon (Shoko.VFS.FUSE.Host)
 
+- **`--warmup` prefetch mode.** One-shot startup that connects, runs the full
+  reconcile, persists per-mount snapshots + clean-shutdown marker, then exits.
+  Pre-loads the cache so a subsequent normal daemon start serves a hot
+  snapshot within seconds instead of paying the 15–45 min cold aggregation
+  on first Plex/Jellyfin scan. Suitable for systemd timers or cron to keep
+  snapshots warm across restarts and library growth. See `BENCHMARKS.md`.
+- **Outage-resilient caching.** Per-mount aggregation caches freeze while
+
 - **Outage-resilient caching.** Per-mount aggregation caches freeze while
   the Shoko Server is unreachable; reads keep returning the last known
   snapshot instead of failing on every access. Unfreeze + reconcile on
