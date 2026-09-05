@@ -111,15 +111,110 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource
             _options.MergeTmdbSeries,
             manualOverrides
         );
-        var rawSeries = allSeries
+        var closedSeries = allSeries
             .Where(series => groupClosure.Contains(series.ID))
+            .ToList();
+        var rawSeries = closedSeries
             .Select(ExtractSeries)
             .ToList();
         var projected = rawSeries.Select(RelayMappingProjector.Project).ToList();
         var groupingInputs = rawSeries
             .Zip(projected, (raw, data) => new RelaySeriesGroupingInput(data, raw.AnidbAnimeId, raw.AirDate, raw.TmdbSeriesId))
             .ToArray();
-        return RelaySeriesGrouper.Merge(groupingInputs, _options.MergeTmdbSeries, manualOverrides);
+        var merged = RelaySeriesGrouper.Merge(groupingInputs, _options.MergeTmdbSeries, manualOverrides);
+
+        // Discover AnimeThemes Theme.mp3 files written by ShokoRelay's AnimeThemesMp3Generator
+        // into the non-VFS source folders, and surface them as series-folder-root extras.
+        // Mirrors the host daemon's ShokoRelayDataSource.DiscoverThemeExtras; the resolver
+        // renders them at <seriesFolder>/Theme.mp3. Restricted to closedSeries so the same
+        // probe discipline applies as the main aggregation path.
+        var extrasBySeries = DiscoverThemeExtras(closedSeries);
+        if (extrasBySeries.Count == 0)
+            return merged;
+        return merged
+            .Select(s => extrasBySeries.TryGetValue(s.SeriesId, out var extra)
+                ? s with { Extras = new[] { extra } }
+                : s)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Probes every distinct source-series folder in the managed folder for a Theme.mp3 file
+    /// and produces a seriesId → ExtraFile map (first match wins per series). Used by
+    /// <see cref="GetAllSeries"/> to surface the theme in the VFS mount — replaces the
+    /// symlink step that ShokoRelay's AnimeThemesMp3Generator skips when
+    /// <c>Advanced.UseExternalVfs=true</c>.
+    /// </summary>
+    private Dictionary<int, ExtraFile> DiscoverThemeExtras(IReadOnlyList<IShokoSeries> allSeries)
+    {
+        var result = new Dictionary<int, ExtraFile>();
+        if (allSeries.Count == 0)
+            return result;
+
+        // Cache probed absolute folders so we stat each one at most once per build.
+        var probedFolders = new HashSet<string>(StringComparer.FromComparison(_pathComparison));
+        foreach (var series in allSeries)
+        {
+            foreach (var episode in series.Episodes ?? Array.Empty<IShokoEpisode>())
+            {
+                if (episode.IsHidden) continue;
+                foreach (var video in episode.Videos ?? Array.Empty<IVideo>())
+                {
+                    foreach (var file in video.Files ?? Array.Empty<IVideoFile>())
+                    {
+                        if (file.ManagedFolderID != _managedFolderId) continue;
+                        if (string.IsNullOrWhiteSpace(file.RelativePath)) continue;
+
+                        var sourceFolder = ResolveSourceFolder(file.RelativePath);
+                        if (sourceFolder is null || !probedFolders.Add(sourceFolder)) continue;
+
+                        var themePath = Path.Combine(sourceFolder, "Theme.mp3");
+                        if (!File.Exists(themePath)) continue;
+
+                        long size;
+                        try { size = new FileInfo(themePath).Length; }
+                        catch { size = 0; }
+
+                        result.TryAdd(series.ID, new ExtraFile("Theme.mp3", themePath, size));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Resolves the absolute source series folder that contains a file at the given
+    /// managed-folder-relative path. Returns null on any validation failure (empty,
+    /// rooted outside the managed folder, etc.).
+    /// </summary>
+    private string? ResolveSourceFolder(string? relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath)) return null;
+        string relative = NormalizeSeparators(relativePath);
+        bool hasSingleLeadingSeparator = relative.Length > 0
+            && relative[0] == Path.DirectorySeparatorChar
+            && (relative.Length == 1 || relative[1] != Path.DirectorySeparatorChar);
+        if (relative.Length == 0
+            || (Path.IsPathRooted(relative) && !hasSingleLeadingSeparator))
+            return null;
+
+        relative = relative.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (relative.Length == 0) return null;
+
+        string parent = Path.GetDirectoryName(relative);
+        if (string.IsNullOrEmpty(parent)) return null;
+
+        try
+        {
+            string candidate = Path.GetFullPath(Path.Combine(_managedFolderRoot, parent));
+            if (!IsContained(candidate)) return null;
+            return candidate;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
     }
 
     private RelayRawSeries ExtractSeries(IShokoSeries series)

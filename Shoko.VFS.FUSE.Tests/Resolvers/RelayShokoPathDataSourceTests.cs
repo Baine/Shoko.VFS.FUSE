@@ -1265,6 +1265,35 @@ public sealed class RelayShokoPathDataSourceTests
         public IReadOnlyList<SeriesData> GetAllSeries() => [series];
     }
 
+    [Fact]
+    public void ThemeMp3SurfacedAsSeriesExtra()
+    {
+        string root = NewDirectory();
+        try
+        {
+            string themePath = Path.Combine(root, "Some Series", "Theme.mp3");
+            Directory.CreateDirectory(Path.GetDirectoryName(themePath)!);
+            File.WriteAllBytes(themePath, new byte[16]);
+            string sourcePath = WriteFile(root, "Some Series/ep1.mkv");
+            var video = Video(123, [Location(7, true, sourcePath, "Some Series/ep1.mkv", 100)]);
+            var episode = Episode(1001, EpisodeType.Episode, 1, null, "Episode", false, video);
+            var series = Series(55, AnimeType.TV, "Series", episode);
+
+            var ds = new RelayShokoPathDataSource(Metadata(series), new RelayPathDataSourceOptions(7, root));
+            var all = ds.GetAllSeries();
+            Assert.Single(all);
+            var s = all[0];
+            Assert.NotNull(s.Extras);
+            Assert.Single(s.Extras!);
+            Assert.Equal("Theme.mp3", s.Extras![0].Name);
+            Assert.Equal(themePath, s.Extras![0].SourcePath);
+        }
+        finally
+        {
+            DeleteDirectory(root);
+        }
+    }
+
     private class StrictDispatchProxy : DispatchProxy
     {
         internal Dictionary<string, object?> Members { get; set; } = new(StringComparer.Ordinal);
