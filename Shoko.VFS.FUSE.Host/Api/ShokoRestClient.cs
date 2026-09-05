@@ -187,11 +187,17 @@ public async Task<IReadOnlyList<FileDto>> GetManagedFolderFilesAsync(int managed
     /// timeouts) up to <see cref="_retries"/> times with exponential backoff. 4xx (other
     /// than 408 / 429) is treated as a permanent failure and propagates immediately.
     /// </summary>
-    private async Task<HttpResponseMessage> SendWithRetryAsync(HttpRequestMessage request, CancellationToken ct = default)
+    /// <remarks>
+    /// <paramref name="requestFactory"/> is invoked once per attempt because
+    /// <see cref="HttpRequestMessage"/> is single-use — sending the same instance twice
+    /// throws <c>InvalidOperationException</c>.
+    /// </remarks>
+    private async Task<HttpResponseMessage> SendWithRetryAsync(Func<HttpRequestMessage> requestFactory, CancellationToken ct = default)
     {
         Exception? last = null;
         for (int attempt = 0; attempt <= _retries; attempt++)
         {
+            using var request = requestFactory();
             try
             {
                 var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
@@ -240,8 +246,7 @@ public async Task<IReadOnlyList<FileDto>> GetManagedFolderFilesAsync(int managed
 
     private async Task<T> GetJsonAsync<T>(string path)
     {
-        using var request = CreateRequest(path);
-        using var response = await SendWithRetryAsync(request).ConfigureAwait(false);
+        using var response = await SendWithRetryAsync(() => CreateRequest(path)).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"GET {path} failed with {(int)response.StatusCode} {response.ReasonPhrase}.");
 
@@ -252,8 +257,7 @@ public async Task<IReadOnlyList<FileDto>> GetManagedFolderFilesAsync(int managed
 
     private async Task<T?> GetJsonOrNullAsync<T>(string path)
     {
-        using var request = CreateRequest(path);
-        using var response = await SendWithRetryAsync(request).ConfigureAwait(false);
+        using var response = await SendWithRetryAsync(() => CreateRequest(path)).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
             return default;
         if (!response.IsSuccessStatusCode)
