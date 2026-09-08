@@ -1,5 +1,17 @@
 # Shoko.VFS.FUSE
 
+> # ⚠️ PROVIDED AS IS — USE AT YOUR OWN RISK
+>
+> This software is a personal hobby project published without any warranty of
+> any kind, express or implied. It mounts virtual filesystems over your media
+> library, runs with elevated privileges, and manipulates mounts on your host.
+> **It may contain bugs, eat your data, break your mounts, or set your cat on
+> fire.** The authors accept no liability for any damage, data loss, or
+> downtime arising from its use. Read the source before you run it, test it
+> against data you can afford to lose, and keep backups. By using this
+> software you accept full responsibility for everything it does — or fails
+> to do — on your systems.
+
 Linux FUSE virtual filesystem for Shoko Server. Two deliverables from the same
 repository:
 
