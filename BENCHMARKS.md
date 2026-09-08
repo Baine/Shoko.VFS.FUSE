@@ -1,12 +1,13 @@
 # Performance: Shoko.VFS.FUSE vs Shokofin vs ShokoRelay
 
-> Host-daemon numbers below are **measured** on the production Unraid host
-> (see [Measured data](#measured-data-production-unraid-host-2026-09-08)),
-> pulled from `/mnt/cache/appdata/shoko-vfs-fuse/logs/daemon.log` and the
-> running processes. Shokofin/ShokoRelay comparison numbers remain
-> architectural estimates derived from the codebase's own reference points
-> (e.g. `ShokoRelayDataSource.cs:133` — "1.4k series × ~200ms serially =
-> 5+ minutes"). Always validate against your own workload.
+> Host-daemon and ShokoRelay numbers below are **measured**: host-daemon data
+> from the production Unraid host (see
+> [Measured data](#measured-data-production-unraid-host-2026-09-08)), pulled
+> from `/mnt/cache/appdata/shoko-vfs-fuse/logs/daemon.log` and the running
+> processes; ShokoRelay data from its own VFS Generation Report (v0.17.4,
+> 2026-09-05, fresh initialization). Shokofin has no measured data — its cells
+> are marked n/m and the previous estimates were removed. Always validate
+> against your own workload.
 
 ## TL;DR
 
@@ -14,14 +15,16 @@ For a **6,152 series / 70,498 files / 70.8 TiB** library:
 
 | Approach | Mount-ready cold start | Steady-state RAM | Disk delta | Survives Shoko restart |
 |---|---|---|---|---|
-| Shokofin (in-tree, virtual VFS) | ~8–20 min * | ~1.5–2.5 GB (shared with Shoko) * | 0 | ❌ |
-| ShokoRelay (in-tree, symlink materialization) | **2–6 hours** + cleanup scan * | ~2–3 GB (shared with Shoko) * | 70,498 symlinks + 37k dirs | ❌ |
+| Shokofin (in-tree, virtual VFS) | n/m | n/m | 0 | ❌ |
+| ShokoRelay (in-tree, symlink materialization) | **1,122 s (~19 min)** fresh generation ✅ measured (v0.17.4) | n/m | **140,038 symlinks** ✅ measured | ❌ |
 | Shoko.VFS.FUSE in-tree (virtual, lazy) | **~1–3 min** (structure pass) * | ~1.2–2.0 GB (shared with Shoko) * | 0 | ❌ |
 | Shoko.VFS.FUSE.Host (REST, lazy + frozen cache) | ~3 s warm / **~40 min** cold reconcile (16 mounts, background) ✅ measured | **~490 MB** (separate) ✅ measured | snapshot JSON: **~1.6 MB** total ✅ measured | ✅ |
 | Shoko.VFS.FUSE.Host **with `--warmup`** | warmup minutes offline, daemon start **~3 s** ✅ measured | same | same | ✅ |
 
-\* = estimate, not measured. All ✅ measured rows come from the production
-Unraid host (16 managed folders, 32 FUSE mounts, see below).
+n/m = not measured; the old Shokofin/ShokoRelay estimates were removed.
+Measured sources: host daemon from the production Unraid host (16 managed
+folders, 32 FUSE mounts, see below); ShokoRelay from its v0.17.4 VFS
+Generation Report. In-tree Shoko.VFS.FUSE rows remain estimates (`*`).
 
 Since the lazy-aggregation rework, the mount publishes a structure-only
 snapshot (series/movie folders) in minutes and materializes each series'
@@ -48,6 +51,12 @@ Source: `/mnt/cache/appdata/shoko-vfs-fuse/logs/daemon.log` (one-day window),
 | Host daemon RSS | **~487 MB** (during active Plex transcode through the mount) |
 | Shoko server (Shoko.CLI) RSS | ~8 GB, for comparison |
 | Errors in 24 h of log | 2 (one transient snapshot-build `ArgumentException`, recovered on next build) |
+| ShokoRelay fresh VFS generation (v0.17.4, 2026-09-05) | **1,122 s (~19 min)**, 4,877 series processed + 1,275 consolidated via overrides, 140,038/140,038 links planned/created, 1 skipped, 0 errors |
+| ShokoRelay per-series worst cases | One Piece 83 s (2,457 links), Detektiv Conan 77 s (2,466), Pokémon 65 s (2,465) |
+
+Notes:
+- 4,877 processed + 1,275 consolidated = 6,152 — confirms the library's
+  series count used throughout this doc.
 
 Notes:
 - The doc's previous "snapshot JSON: ~50–500 MB" estimate was wrong by ~2–3
@@ -98,8 +107,8 @@ Notes:
 
 | | Process | Typical RSS |
 |---|---|---|
-| Shokofin | Shoko + Shokofin module | ~1.5–2.5 GB (inherits all of Shoko's caches) |
-| ShokoRelay | Shoko + ShokoRelay plugin | ~2–3 GB (Shoko + symlink tracking + cleanup index) |
+| Shokofin | Shoko + Shokofin module | n/m |
+| ShokoRelay | Shoko + ShokoRelay plugin | n/m |
 | Shoko.VFS.FUSE in-tree | Shoko + plugin | ~1.2–2.0 GB |
 | Shoko.VFS.FUSE.Host | Standalone | **~490 MB measured** (separate process; + ~1.6 MB snapshot files on disk for 32 mounts) |
 
@@ -108,7 +117,7 @@ Notes:
 | | Symlinks | Snapshot cache | Idle inode cost |
 |---|---|---|---|
 | Shokofin | 0 | 0 | 0 |
-| ShokoRelay | **70,498 symlinks** (~5–10 MB metadata) + ~37,000 directories | 0 | inode-heavy |
+| ShokoRelay | **140,038 symlinks** ✅ measured (v0.17.4 generation report) | 0 | inode-heavy |
 | Shoko.VFS.FUSE in-tree | 0 | 0 | 0 |
 | Shoko.VFS.FUSE.Host | 0 | **~1.6 MB JSON measured** (32 files, largest ~180 KB — structure-only, no per-file payload) | trivial |
 
@@ -116,28 +125,32 @@ Notes:
 
 ### vs ShokoRelay (the biggest delta)
 
-- **Materialization: skipped entirely.** ShokoRelay would create 70k symlinks
-  on first run. At ~50 symlinks/sec on a hot filesystem that's ~25 min just
-  for the `symlink()` syscalls, plus directory enumeration, ID3 tag reads,
-  and VFS blueprint serialization — realistically **2–6 hours** for a clean
-  first run on a 6k-series library, often interrupted and resumed.
-- **Cleanup jobs: gone.** ShokoRelay's prune-orphan runs scan the entire VFS
-  tree on every reconcile (~62k directory entries to stat). With ShokoRelay's
-  typical 5-minute reconcile cycle, that's 12 stat-walks per hour of idle.
-  The host daemon does zero.
-- **Rebuild time after crash: minutes, not hours.** ShokoRelay on a partial
-  crash leaves dangling symlinks; the next reconcile must enumerate every
-  directory to know what to recreate. With the host daemon's snapshot cache,
-  recovery is "load JSON, mark dirty, rebuild" — minutes even at this scale.
-- **Time-to-first-mount:** ShokoRelay's first run takes hours before any FUSE
-  read can return data. Shoko.VFS.FUSE.Host serves a stale snapshot within
-  seconds (from the loaded persisted cache, when available).
+Measured on this library — ShokoRelay v0.17.4's fresh VFS generation:
+**1,122 s (~19 min)** for 140,038 links across 4,877 series (+1,275
+consolidated), 0 errors.
+
+- **Materialization: skipped entirely.** The host daemon creates zero
+  symlinks; ShokoRelay's report shows 140,038 links, and that
+  materialization cost recurs whenever its VFS blueprint must be rebuilt.
+- **Cleanup jobs: gone.** ShokoRelay's prune-orphan runs rescan the VFS tree
+  on every reconcile; the host daemon does zero filesystem walks.
+- **Rebuild after crash: snapshot load, not tree rescan.** ShokoRelay must
+  enumerate what exists to know what to recreate after a partial crash; the
+  host daemon loads a ~1.6 MB snapshot per mount, marks dirty, rebuilds —
+  measured warm start ~3 s for all 16 mounts.
+- **Time-to-first-mount:** ShokoRelay's fresh generation took ~19 min before
+  anything could be served; the host daemon with a persisted snapshot serves
+  within seconds (measured) and reconciles in the background.
+- **Honest note:** ShokoRelay's clean ~19 min generation is *faster* than
+  the host daemon's cold full-fleet reconcile (~40 min). The daemon's win is
+  not the cold path — it's that the snapshot cache makes restarts ~3 s, and
+  you pay the long path only when the cache is actually gone.
 
 ### vs Shokofin (smaller wins, mostly resilience)
 
-- **Survives ShokoServer restarts.** For a 6,152-series aggregation, ShokoServer
-  restart takes 8–20 min to rebuild its own caches; during that window,
-  Shokofin mounts are dead. The host daemon's frozen cache keeps the mount
+- **Survives ShokoServer restarts.** During a ShokoServer restart (which
+  rebuilds its own caches for minutes at this library size), Shokofin mounts
+  are dead. The host daemon's frozen cache keeps the mount
   serving stale data through the restart — Plex/Jellyfin clients don't drop.
 - **Outage noise gone.** The 404/timeout cascade that triggered this whole
   branch of work is solved by `Freeze`/`Unfreeze` + retry/backoff on the
@@ -156,7 +169,8 @@ Notes:
   go through a hot path. Plex/Jellyfin typically cache metadata so this is
   a one-time cost per scan.
 - **First aggregation pain:** ~40 min full-fleet reconcile on this deployment
-  (16 managed folders, measured) vs 8–20 min for Shokofin. Mitigated twice
+  (16 managed folders, measured); Shokofin's cold aggregation is not
+  measured on this library. Mitigated twice
   over: the frozen cache serves within seconds, and `--warmup` moves the
   reconcile offline (below).
 - **Memory:** host daemon is its own process. 1 GB dedicated is non-trivial
@@ -280,9 +294,9 @@ thereafter to keep the snapshots warm across restarts.
   round-trip. With `--warmup` ahead of time, "cold reads" become rare.
 - "Steady-state RAM" depends heavily on how many files are visible
   simultaneously in the resolver snapshot.
-- ShokoRelay's biggest cost is *materialization*, not steady-state — at
-  smaller libraries (< 500 series) the difference narrows and the choice
-  becomes mostly about features.
+- ShokoRelay's dominant cost is *materialization* (140,038 links,
+  measured); at smaller libraries the gap to the host daemon narrows and the
+  choice becomes mostly about features.
 - For libraries > 5k series, the host daemon's persistent snapshot cache
   is the meaningful differentiator — it survives reboots and crashes.
   In-tree Shoko.VFS.FUSE has no equivalent yet.
