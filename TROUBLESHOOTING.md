@@ -66,6 +66,47 @@ a healthy server connection but no errors.
    `~/.local/share/shoko-vfs-fuse/snapshots/<managedFolderId>_<rootKind>.snapshot.json`
    and restart.
 
+## Relay mounts are empty over NFS (fine locally and via SMB)
+
+**Symptom**: `!ShokoRelay*` directories list their content on the Unraid host
+and via SMB, but over NFS they show up empty; `stat` over NFS reports
+different owner/mode than on the host.
+
+**Cause**: The Linux NFS server cannot cross into FUSE submounts. The relay
+mounts are FUSE filesystems nested inside `/mnt/user` (itself FUSE-based
+shfs), so an export of `/mnt/user/array` — even with `crossmnt` — serves the
+empty underlying directory instead of the mount. This is a knfsd limitation,
+not a permission or `allow_other` problem.
+
+**Fix**: Export every relay mount individually; knfsd serves a FUSE
+filesystem directly without issue. Enable the opt-in helper and let the
+daemon maintain the exports (see `deploy/README.md`, "NFS Export"):
+
+```sh
+# /path/to/shoko-vfs-fuse.env (beside start-shoko-vfs-fuse.sh)
+INSTALL_NFS_EXPORTS=1
+```
+
+then restart the daemon. NFSv4 clients pick the new exports up on their next
+lookup; if a formerly empty directory still lists empty, drop the client's
+stale handles once: `sudo systemctl restart mnt-array.automount` (unit name
+derived from the mount path).
+
+## `Failed to build the Shoko VFS resolver snapshot` with `duplicate key`
+
+**Symptom**: Log shows `System.ArgumentException: An item with the same key
+has already been added. Key: <seriesId>` thrown from
+`RelaySeriesGrouper.GroupIds` during `BuildSnapshot`; relay folders keep
+serving stale (cached) content.
+
+**Cause**: `GET /api/v3/Series` is paginated without a unique sort key, so a
+series row can shift between two page requests while the daemon enumerates
+(e.g. an import is running) and be returned twice. The duplicate series ID
+crashed the grouping step and aborted the whole snapshot build.
+
+**Fix**: Fixed in the daemon (client-side dedupe by series ID, first-wins in
+the grouper). Update to a version containing the fix and restart.
+
 ## `Theme.mp3` does not appear in the VFS
 
 **Symptom**: Plex/Jellyfin clients do not see `Theme.mp3` next to the season

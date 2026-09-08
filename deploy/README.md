@@ -91,18 +91,49 @@ The script:
 - Writes PID to `/var/run/shoko-vfs-fuse.pid`.
 - Logs to `/var/log/shoko-vfs-fuse/daemon.log`.
 
-## NFS Export
+## NFS Export (opt-in)
 
-The FUSE mounts appear under `/mnt/user` on Unraid. To share them via NFS:
+The relay mounts are FUSE filesystems nested under `/mnt/user` (itself the
+FUSE-based shfs). The Linux NFS server **cannot cross into FUSE submounts**:
+an export of `/mnt/user/array` with `crossmnt` serves the array content fine,
+but the `!ShokoRelay*` mountpoints appear empty to NFS clients — even though
+they work locally and via SMB. This is a knfsd limitation with FUSE-in-FUSE
+mounts, not a daemon or permission problem.
 
-1. **Unraid GUI** → Settings → NFS → Shares.
-2. Add or verify an export for `/mnt/user` (or the specific managed folder subdirectory).
-3. Clients mount with: `mount -t nfs <unraid-ip>:/mnt/user /mnt/nfs-shoko`.
+The fix is one dedicated export entry per relay mount: knfsd serves a FUSE
+filesystem directly without problems (Unraid's own `/mnt/user` export is
+exactly that). The daemon ships `install-nfs-exports.sh`, which regenerates
+`/etc/exports.d/shoko-vfs.exports` from the live mount list (stable hash-based
+fsids so client file handles survive re-runs) and reloads the exports.
 
-The virtual files are then accessible at:
+**This is disabled by default** — installations that do not use NFS never run
+it and don't need to think about it. To enable:
+
+```sh
+# persistent: /mnt/cache/appdata/shoko-vfs-fuse/shoko-vfs-fuse.env
+INSTALL_NFS_EXPORTS=1
+
+# optional: restrict export clients (default: 192.168.178.20)
+CLIENTS="192.168.178.20 192.168.178.21"
 ```
-/nfs-shoko/<managed-folder>/!ShokoRelayVFS/<series>/<episode>.mkv
-```
+
+The start script sources `shoko-vfs-fuse.env` (same directory as the script)
+and, when enabled, runs the helper shortly after every daemon start — new or
+removed relay mounts are picked up automatically. Requirements:
+
+- The script must run as root (it touches `/etc/exports.d` and `exportfs`).
+- The NFS server must be enabled on Unraid (Settings → NFS).
+- On Unraid, `/etc` is tmpfs: the exports file is restored at the next daemon
+  start, not at boot. If you share the mounts over NFS *before* the daemon has
+  ever started since boot, run the helper once manually:
+  `sudo /mnt/cache/appdata/shoko-vfs-fuse/install-nfs-exports.sh`
+
+Clients need no extra mounts: an NFSv4 mount of the array (or `/mnt/user`)
+transparently crosses into the per-mount exports on first access. If a
+directory that was previously empty still shows empty, the client has stale
+cached handles — restart its automount or remount once:
+`sudo systemctl restart mnt-array.automount` (unit name derived from the
+mount path).
 
 ## Container Access (Docker)
 

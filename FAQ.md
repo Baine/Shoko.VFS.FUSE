@@ -36,6 +36,16 @@ Short version: the daemon now freezes its in-memory snapshot when the Shoko
 server is unreachable, so FUSE reads keep working with stale data instead of
 failing on every access.
 
+## Why are the relay mounts empty over NFS (but fine via SMB)?
+
+The Linux NFS server cannot cross into FUSE submounts, and the relay mounts
+are FUSE filesystems nested inside `/mnt/user` (itself FUSE-based shfs) —
+so exporting the parent with `crossmnt` serves empty directories. The fix
+is one export per relay mount; the daemon ships an opt-in helper
+(`INSTALL_NFS_EXPORTS=1`, disabled by default) that maintains them
+automatically. See `TROUBLESHOOTING.md` and the "NFS Export" section of
+`deploy/README.md`.
+
 ## Where do snapshots live on disk?
 
 `$XDG_DATA_HOME/shoko-vfs-fuse/snapshots/` (or
