@@ -205,6 +205,26 @@ public sealed class HostConfig
     /// </summary>
     public int PathValidationMaxPathLength { get; set; } = 500;
 
+    // -- NFS --
+
+    /// <summary>
+    /// Keep the relay FUSE mounts exported over NFS via the bundled
+    /// <c>install-nfs-exports.sh</c> (run after each reconcile). Off by default —
+    /// only needed when the mounts are shared via NFS, because the Linux NFS
+    /// server cannot cross into FUSE submounts of the shfs parent and every
+    /// relay mount needs its own export entry. Requires root (the daemon's
+    /// usual run mode on Unraid). See deploy/README.md.
+    /// Default: <c>false</c>.
+    /// </summary>
+    public bool InstallNfsExports { get; set; }
+
+    /// <summary>
+    /// Space-separated NFS client specs passed to <c>install-nfs-exports.sh</c>
+    /// (its <c>CLIENTS</c> env). Default: <c>*</c> (any host, all_squash to
+    /// nobody:users). Example: <c>192.168.178.20 192.168.178.21</c>.
+    /// </summary>
+    public string NfsExportClients { get; set; } = "*";
+
     /// <summary>
     /// Loads configuration from an optional JSON file (Newtonsoft, JSONC comments allowed),
     /// then applies environment-variable overrides. Missing/absent values keep their defaults.

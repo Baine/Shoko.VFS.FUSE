@@ -63,5 +63,13 @@
 
   // -- Validation --
   "PathValidationSamples": 5,
-  "PathValidationMaxPathLength": 500
+  "PathValidationMaxPathLength": 500,
+
+  // -- NFS (opt-in) --
+  // knfsd cannot cross into FUSE submounts of /mnt/user (shfs), so each relay
+  // mount needs its own export entry. When true, the daemon runs the bundled
+  // install-nfs-exports.sh after each reconcile to keep exports in sync.
+  // Requires root and an enabled NFS server on the host. See deploy/README.md.
+  "InstallNfsExports": false,
+  "NfsExportClients": "*"
 }

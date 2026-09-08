@@ -102,30 +102,32 @@ mounts, not a daemon or permission problem.
 
 The fix is one dedicated export entry per relay mount: knfsd serves a FUSE
 filesystem directly without problems (Unraid's own `/mnt/user` export is
-exactly that). The daemon ships `install-nfs-exports.sh`, which regenerates
-`/etc/exports.d/shoko-vfs.exports` from the live mount list (stable hash-based
-fsids so client file handles survive re-runs) and reloads the exports.
+exactly that). The daemon package ships `install-nfs-exports.sh`, which
+regenerates `/etc/exports.d/shoko-vfs.exports` from the live mount list
+(stable hash-based fsids so client file handles survive re-runs) and reloads
+the exports.
 
 **This is disabled by default** — installations that do not use NFS never run
-it and don't need to think about it. To enable:
+it and don't need to think about it. To enable, set in `config.json`:
 
-```sh
-# persistent: /mnt/cache/appdata/shoko-vfs-fuse/shoko-vfs-fuse.env
-INSTALL_NFS_EXPORTS=1
-
-# optional: restrict export clients (default: 192.168.178.20)
-CLIENTS="192.168.178.20 192.168.178.21"
+```jsonc
+{
+  "InstallNfsExports": true,
+  // optional: space-separated client specs (default: "*", all_squash to nobody:users)
+  "NfsExportClients": "192.168.178.20 192.168.178.21"
+}
 ```
 
-The start script sources `shoko-vfs-fuse.env` (same directory as the script)
-and, when enabled, runs the helper shortly after every daemon start — new or
-removed relay mounts are picked up automatically. Requirements:
+After every reconcile the daemon runs the helper (idempotent, best-effort:
+failures are logged, never fatal), so new or removed relay mounts are picked
+up automatically. Requirements:
 
-- The script must run as root (it touches `/etc/exports.d` and `exportfs`).
+- The daemon must run as root (its usual mode on Unraid) — `exportfs` and
+  `/etc/exports.d` need it.
 - The NFS server must be enabled on Unraid (Settings → NFS).
 - On Unraid, `/etc` is tmpfs: the exports file is restored at the next daemon
-  start, not at boot. If you share the mounts over NFS *before* the daemon has
-  ever started since boot, run the helper once manually:
+  reconcile, not at boot. To share the mounts before the daemon has started
+  since boot, run the helper once manually:
   `sudo /mnt/cache/appdata/shoko-vfs-fuse/install-nfs-exports.sh`
 
 Clients need no extra mounts: an NFSv4 mount of the array (or `/mnt/user`)

@@ -58,19 +58,6 @@ CONFIG="${CONFIG:-$SCRIPT_DIR/config.json}"
 LOGDIR="${LOGDIR:-$SCRIPT_DIR/logs}"
 PIDFILE="${PIDFILE:-/var/run/shoko-vfs-fuse.pid}"
 
-# Optional persistent settings file (same dir as the script). Lets an
-# installation enable opt-in features (e.g. INSTALL_NFS_EXPORTS=1) without
-# editing the script — survives updates shipped in the publish tarball.
-ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/shoko-vfs-fuse.env}"
-if [ -f "$ENV_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-fi
-
-# NFS export maintenance (install-nfs-exports.sh). OFF by default — only
-# needed when the relay mounts are shared via NFS. See deploy/README.md.
-INSTALL_NFS_EXPORTS="${INSTALL_NFS_EXPORTS:-0}"
-
 SHOKO_URL="${SHOKO_URL:-}"
 SHOKO_USER="${SHOKO_USER:-}"
 SHOKO_PASS="${SHOKO_PASS:-}"
@@ -113,13 +100,9 @@ Environment overrides:
   WARMUP_BEFORE_START  Set to 1 to run the warmup action automatically
                        before launching the daemon in the start action.
                        Blocks for the duration of the cold aggregation.
-  INSTALL_NFS_EXPORTS  Set to 1 to keep the relay mounts exported over
-                       NFS after each start (opt-in; default off).
 
-Settings file:
-  $SCRIPT_DIR/shoko-vfs-fuse.env (if present) is sourced before the
-  overrides above are applied — persistent place for INSTALL_NFS_EXPORTS=1
-  or any of the environment settings.
+NFS export maintenance is configured in config.json (InstallNfsExports,
+NfsExportClients) and runs inside the daemon — see deploy/README.md.
 
 If CONFIG does not exist, connection settings may be supplied via:
   SHOKO_URL
@@ -318,16 +301,6 @@ start_daemon() {
     fi
 
     log "Started (PID $pid)."
-
-    # Opt-in (INSTALL_NFS_EXPORTS=1): keep the relay mounts exported over NFS.
-    # knfsd cannot cross into FUSE submounts, so each fuse.shoko-vfs mount
-    # needs its own export entry (see install-nfs-exports.sh / README).
-    if [ "$INSTALL_NFS_EXPORTS" = "1" ]; then
-        nfs_helper="$(dirname "$0")/install-nfs-exports.sh"
-        if [ -x "$nfs_helper" ]; then
-            ( sleep 5; "$nfs_helper" >> "$LOGDIR/daemon.log" 2>&1 ) &
-        fi
-    fi
 }
 
 foreground_daemon() {

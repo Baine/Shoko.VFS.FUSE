@@ -4,16 +4,16 @@
 # knfsd cannot cross into FUSE submounts of an exported FUSE parent (shfs),
 # so every fuse.shoko-vfs mount needs its own export entry. This script
 # regenerates /etc/exports.d/shoko-vfs.exports from the mounts that exist
-# right now and reloads the NFS exports. Idempotent: run it after every
-# daemon start (mount set only changes then) — e.g. from the go file,
-# User Scripts at array start, or start-shoko-vfs-fuse.sh.
+# right now and reloads the NFS exports. Idempotent: the daemon runs it after
+# every reconcile when InstallNfsExports is enabled; running it by hand is
+# fine too. Requires root.
 #
 # Export policy mirrors the parent array export: rw, all_squash to
 # nobody:users, sec=sys, for the clients listed below.
 set -euo pipefail
 
 EXPORTS_FILE="${EXPORTS_FILE:-/etc/exports.d/shoko-vfs.exports}"
-CLIENTS="${CLIENTS:-192.168.178.20}"
+CLIENTS="${CLIENTS:-*}"
 
 [[ $(id -u) -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Shoko.Abstractions.Video.Enums;
 using Shoko.VFS.FUSE.Configuration;
@@ -623,6 +624,10 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
             // Reconcile.
             await ReconcileDesiredAsync(desired, desiredPaths, ct).ConfigureAwait(false);
 
+            // Opt-in NFS export maintenance (knfsd cannot cross into FUSE
+            // submounts, so each relay mount needs its own export entry).
+            RefreshNfsExports();
+
             // Update tracker.
             _state.Mounts = BuildMountStatuses(desired);
             _state.LastReconcileError = null;
@@ -645,6 +650,59 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
                 _reconcileRequested = false;
                 await SafeReconcileAsync().ConfigureAwait(false);
             }
+        }
+    }
+
+    /// <summary>
+    /// Opt-in: keep the relay FUSE mounts exported over NFS. knfsd cannot cross
+    /// into FUSE submounts of the shfs parent, so every fuse.shoko-vfs mount
+    /// needs its own export entry; the bundled install-nfs-exports.sh regenerates
+    /// /etc/exports.d/shoko-vfs.exports from the live mount list (idempotent).
+    /// Best-effort: failures are logged, never fail the reconcile.
+    /// </summary>
+    private void RefreshNfsExports()
+    {
+        if (!_config.InstallNfsExports)
+            return;
+        if (!OperatingSystem.IsLinux())
+        {
+            _logger.LogDebug("NFS export maintenance skipped: not running on Linux.");
+            return;
+        }
+
+        var helper = Path.Combine(AppContext.BaseDirectory, "install-nfs-exports.sh");
+        if (!File.Exists(helper))
+        {
+            _logger.LogWarning(
+                "InstallNfsExports is enabled but {Helper} was not found; reinstall the daemon package or run the helper manually.",
+                helper);
+            return;
+        }
+
+        try
+        {
+            var psi = new ProcessStartInfo("/bin/bash", helper)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.EnvironmentVariables["CLIENTS"] = _config.NfsExportClients;
+            using var process = Process.Start(psi)!;
+            var stdout = process.StandardOutput.ReadToEnd().Trim();
+            var stderr = process.StandardError.ReadToEnd().Trim();
+            process.WaitForExit();
+
+            if (process.ExitCode == 0)
+                _logger.LogInformation("NFS exports refreshed. {Detail}", stdout);
+            else
+                _logger.LogWarning(
+                    "NFS export refresh failed (exit {ExitCode}). stdout: {Stdout} stderr: {Stderr}",
+                    process.ExitCode, stdout, stderr);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "NFS export refresh could not be executed; is bash available and the daemon running as root?");
         }
     }
 

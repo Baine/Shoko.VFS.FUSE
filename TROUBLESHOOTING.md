@@ -82,9 +82,9 @@ not a permission or `allow_other` problem.
 filesystem directly without issue. Enable the opt-in helper and let the
 daemon maintain the exports (see `deploy/README.md`, "NFS Export"):
 
-```sh
-# /path/to/shoko-vfs-fuse.env (beside start-shoko-vfs-fuse.sh)
-INSTALL_NFS_EXPORTS=1
+```jsonc
+// config.json
+{ "InstallNfsExports": true }
 ```
 
 then restart the daemon. NFSv4 clients pick the new exports up on their next
