@@ -105,7 +105,7 @@ public sealed class RelayMountPlanner
         var targets = new List<RelayMountTarget>();
         foreach (var folder in eligible)
         {
-            AddTarget(targets, folder, folder.Path, configuration.RelayTvFolderName.Trim(), RelayMountRootKind.Tv, TvOptions(configuration.MovieGenerationMode));
+            AddTarget(targets, folder, folder.Path, configuration.RelayTvFolderName.Trim(), RelayMountRootKind.Tv, TvOptions(configuration));
             if (configuration.MovieGenerationMode != MovieGenerationMode.Disabled)
                 AddTarget(targets, folder, folder.Path, configuration.RelayMovieFolderName.Trim(), RelayMountRootKind.Movie, MovieOptions(configuration));
         }
@@ -163,10 +163,10 @@ public sealed class RelayMountPlanner
             options));
     }
 
-    private static PathResolverOptions TvOptions(MovieGenerationMode mode) => mode switch
+    private static PathResolverOptions TvOptions(FusePluginConfiguration configuration) => configuration.MovieGenerationMode switch
     {
-        MovieGenerationMode.EnabledRemove => new PathResolverOptions { Shows = true, MoviesAsTv = false },
-        _ => new PathResolverOptions { Shows = true, MoviesAsTv = true },
+        MovieGenerationMode.EnabledRemove => new PathResolverOptions { Shows = true, MoviesAsTv = false, SeriesCacheTtl = SeriesCacheTtl(configuration) },
+        _ => new PathResolverOptions { Shows = true, MoviesAsTv = true, SeriesCacheTtl = SeriesCacheTtl(configuration) },
     };
 
     private static PathResolverOptions MovieOptions(FusePluginConfiguration configuration) => new()
@@ -175,7 +175,11 @@ public sealed class RelayMountPlanner
         MoviesAsTv = false,
         StandaloneMovies = true,
         IncludeMovieExtras = configuration.PlexLocalExtras,
+        SeriesCacheTtl = SeriesCacheTtl(configuration),
     };
+
+    private static TimeSpan SeriesCacheTtl(FusePluginConfiguration configuration) =>
+        TimeSpan.FromMinutes(Math.Clamp(configuration.SeriesCacheTtlMinutes, 0, 525600));
 
     private static IEnumerable<string> SplitLines(string? value) =>
         (value ?? "").Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);

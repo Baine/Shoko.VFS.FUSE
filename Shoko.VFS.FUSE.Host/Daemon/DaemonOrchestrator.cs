@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using Shoko.Abstractions.Video.Enums;
 using Shoko.VFS.FUSE.Configuration;
@@ -41,6 +42,11 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
     private bool _connected;
     private bool _stopped;
     private volatile bool _reconcileRequested;
+
+    // Coalesced content-change tracking: file ids seen since the last flush, or a
+    // full-invalidation flag when an event carried no usable file id (or a storm overflowed).
+    private readonly ConcurrentQueue<int> _dirtyFileIds = new();
+    private int _fullContentInvalidation;
 
     public DaemonOrchestrator(HostConfig config, DaemonStateTracker state, ILoggerFactory loggerFactory)
     {
@@ -124,25 +130,94 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
     }
 
     /// <summary>
-    /// One-shot warmup: connects to Shoko, performs the full startup reconcile, and
-    /// returns. <see cref="StopAsync"/> / <see cref="DisposeAsync"/> flush the per-mount
-    /// snapshots + clean-shutdown marker so a subsequent normal <see cref="RunAsync"/>
-    /// starts hot. Useful as a pre-deploy cache prime, or as a periodic refresh that
-    /// does not require keeping the daemon process alive.
+    /// One-shot warmup: connects to Shoko and aggregates, validates, and persists one
+    /// snapshot per managed folder — without mounting anything. The snapshot cache lives
+    /// in the data source, not the FUSE mount, so leases are unnecessary; this keeps
+    /// warmup free of mount/unmount churn and persists each folder's snapshot as soon
+    /// as it is built (a cancelled warmup keeps everything finished so far).
     ///
-    /// The full reconcile (and therefore FUSE mount creation for each lease) still runs —
-    /// the cache lives in the lease data source, so mounting is part of warming it.
-    /// The leases are torn down on <see cref="DisposeAsync"/>.
+    /// Tv and Movie targets of the same managed folder share identical data-source
+    /// options and snapshot content, so aggregation runs once per folder and the result
+    /// is stored under each target's snapshot key.
     /// </summary>
     public async Task WarmupAsync(CancellationToken ct)
     {
         _state.State = DaemonState.WaitingForServer;
         _logger.LogInformation("Warmup: connecting to {Url}", _config.ShokoUrl);
 
-        await InitializeAsync(ct).ConfigureAwait(false);
+        if (!await WaitForServerAsync(ct).ConfigureAwait(false))
+            throw new TimeoutException(
+                $"Shoko server at {_config.ShokoUrl} did not become reachable within {_config.ServerStartupTimeout.TotalSeconds:0}s.");
+        await LoginAsync(ct).ConfigureAwait(false);
+
+        if (_snapshotStore is null)
+        {
+            _logger.LogWarning("Warmup: no snapshot store configured; nothing to persist.");
+            return;
+        }
+
+        var folders = await _client.GetManagedFoldersAsync().ConfigureAwait(false);
+        var (targets, _, _) = BuildPlan(folders, _config);
+        var byFolder = targets.GroupBy(t => t.ManagedFolderId).ToList();
+        _logger.LogInformation(
+            "Warmup: aggregating {FolderCount} managed folder(s) for {TargetCount} mount snapshot(s).",
+            byFolder.Count, targets.Count);
+
+        // ponytail: fixed degree 3; one folder is already 4 parallel HTTP requests deep,
+        // so this keeps server load sane while cutting wall-clock ~3x vs sequential.
+        await Parallel.ForEachAsync(byFolder,
+            new ParallelOptions { MaxDegreeOfParallelism = 3, CancellationToken = ct },
+            async (group, token) =>
+            {
+                var folderTargets = group.ToArray();
+                var first = folderTargets[0];
+                var dataSource = DaemonMounter.CreateDataSource(first, _config, _client, _snapshotStore);
+                try
+                {
+                    token.ThrowIfCancellationRequested();
+                    var snapshot = await dataSource.GetAllSeriesAsync().ConfigureAwait(false);
+
+                    if (!PathValidation.ValidatePaths(snapshot, _config.PathValidationSamples,
+                            _config.PathValidationMaxPathLength,
+                            msg => _logger.LogWarning("[Warmup {Folder}] {Message}", first.ManagedFolderName, msg)))
+                    {
+                        _logger.LogError(
+                            "Warmup {Folder} (id {Id}) failed path validation: source paths missing on disk; snapshot not persisted.",
+                            first.ManagedFolderName, group.Key);
+                        return;
+                    }
+
+                    var stored = dataSource.GetSnapshot();
+                    if (stored is null)
+                    {
+                        _logger.LogWarning(
+                            "Warmup {Folder}: aggregation cache unavailable (AggregationCacheTtl disabled?); nothing persisted.",
+                            first.ManagedFolderName);
+                        return;
+                    }
+
+                    // Progressive persistence: each key is written as soon as the folder's
+                    // aggregation is done, so an interrupted warmup keeps its progress.
+                    foreach (var target in folderTargets)
+                    {
+                        try { _snapshotStore.Save($"{target.ManagedFolderId}_{target.RootKind}", stored); }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Snapshot save failed for {Name}.", target.TargetPath);
+                        }
+                    }
+                    _logger.LogInformation(
+                        "Warmup: snapshot persisted for {Folder} ({Series} series).",
+                        first.ManagedFolderName, snapshot.Count);
+                }
+                finally
+                {
+                    dataSource.Dispose();
+                }
+            }).ConfigureAwait(false);
 
         _logger.LogInformation(
-            "Warmup: complete. Disposing orchestrator will persist per-mount snapshots + clean-shutdown marker.");
+            "Warmup: complete. Next normal daemon start will load the snapshots and skip the cold aggregation.");
     }
 
     /// <summary>
@@ -175,7 +250,7 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
         await LoadPersistedSnapshotsAsync().ConfigureAwait(false);
 
         // 6. Startup reconcile (uses the loaded snapshot if available; rebuilds otherwise).
-        await ReconcileAsync().ConfigureAwait(false);
+        await ReconcileAsync(ct).ConfigureAwait(false);
     }
 
     private async Task<bool> WaitForServerAsync(CancellationToken ct)
@@ -218,12 +293,14 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
 
         _signalR = new ShokoSignalRConnection(_config.ShokoUrl!, _client.ApiKey!,
             message => _logger.LogDebug("SignalR: {Message}", message));
-        _signalR.FileDetected += (_, _) => _contentCoalescer.Trigger();
-        _signalR.FileHashed += (_, _) => _contentCoalescer.Trigger();
-        _signalR.FileRelocated += (_, _) => _contentCoalescer.Trigger();
-        _signalR.FileDeleted += (_, _) => _contentCoalescer.Trigger();
-        _signalR.ReleaseSaved += (_, _) => _contentCoalescer.Trigger();
-        _signalR.ReleaseRemoved += (_, _) => _contentCoalescer.Trigger();
+        // File-event payloads carry a FileID (except file:detected); none carries a SeriesID,
+        // so per-series scoping goes through the data source's file→series xref index.
+        _signalR.FileDetected += (_, _) => OnContentEvent(fileId: null);
+        _signalR.FileHashed += (_, e) => OnContentEvent(e.FileId);
+        _signalR.FileRelocated += (_, e) => OnContentEvent(e.FileId);
+        _signalR.FileDeleted += (_, e) => OnContentEvent(e.FileId);
+        _signalR.ReleaseSaved += (_, e) => OnContentEvent(e.FileId);
+        _signalR.ReleaseRemoved += (_, e) => OnContentEvent(e.FileId);
         _signalR.ManagedFolderAdded += (_, _) => _topologyCoalescer.Trigger();
         _signalR.ManagedFolderUpdated += (_, _) => _topologyCoalescer.Trigger();
         _signalR.ManagedFolderRemoved += (_, _) => _topologyCoalescer.Trigger();
@@ -231,6 +308,7 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
         {
             _logger.LogInformation("SignalR reconnected; running full reconcile + content invalidation.");
             await SafeReconcileAsync().ConfigureAwait(false);
+            InvalidateAllContent();
             await InvalidateContentAsync().ConfigureAwait(false);
         };
 
@@ -347,11 +425,49 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
         }
     }
 
+    private void InvalidateAllContent() => Interlocked.Exchange(ref _fullContentInvalidation, 1);
+
+    /// <summary>
+    /// Records a content-dirty signal. Events with a FileID are queued for targeted
+    /// per-series invalidation at the next coalesced flush; events without one (file:detected)
+    /// or a queue overflow force a full invalidation, matching the old blanket behavior.
+    /// </summary>
+    private void OnContentEvent(int? fileId)
+    {
+        if (fileId is > 0 && Volatile.Read(ref _fullContentInvalidation) == 0 && _dirtyFileIds.Count < 512)
+            _dirtyFileIds.Enqueue(fileId.Value);
+        else
+            InvalidateAllContent();
+        _contentCoalescer?.Trigger();
+    }
+
     private async Task InvalidateContentAsync()
     {
-        _logger.LogDebug("Content dirty (coalesced); invalidating all mount data sources.");
-        foreach (var lease in _leases.Values.ToArray())
-            lease.Invalidate();
+        var fileIds = new List<int>();
+        while (_dirtyFileIds.TryDequeue(out var id))
+            fileIds.Add(id);
+        bool full = Interlocked.Exchange(ref _fullContentInvalidation, 0) != 0;
+        if (fileIds.Count > 0 && fileIds.Count > 256)
+        {
+            // ponytail: a huge burst is a batch operation; one rebuild beats hundreds of
+            // targeted cache drops. Small storms stay targeted.
+            full = true;
+            fileIds.Clear();
+        }
+
+        if (full)
+        {
+            _logger.LogDebug("Content dirty (coalesced); invalidating all mount data sources.");
+            foreach (var lease in _leases.Values.ToArray())
+                lease.Invalidate();
+        }
+        else if (fileIds.Count > 0)
+        {
+            _logger.LogDebug("Content dirty (coalesced): {Count} file event(s); targeted per-series invalidation.", fileIds.Count);
+            foreach (var lease in _leases.Values.ToArray())
+                foreach (var id in fileIds)
+                    lease.InvalidateFile(id);
+        }
         await Task.CompletedTask.ConfigureAwait(false);
     }
 
@@ -374,6 +490,7 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
             _logger.LogInformation("Server is UP; unfreezing caches and rebuilding.");
             UnfreezeAllLeases();
             await SafeReconcileAsync().ConfigureAwait(false);
+            InvalidateAllContent();
             await InvalidateContentAsync().ConfigureAwait(false);
         };
         _availability.ServerDown += (_, _) =>
@@ -470,8 +587,9 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
     /// <summary>
     /// Reconciles desired versus mounted topology. Safe to call concurrently: if a
     /// reconcile is already running the new trigger is dropped (coalescing).
+    /// <paramref name="ct"/> aborts between mount operations (e.g. Ctrl+C during startup).
     /// </summary>
-    public async Task ReconcileAsync()
+    public async Task ReconcileAsync(CancellationToken ct = default)
     {
         if (!_connected)
             return;
@@ -503,7 +621,7 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
                 desired.Select(t => t.ManagedFolderId).Distinct().Count());
 
             // Reconcile.
-            await ReconcileDesiredAsync(desired, desiredPaths).ConfigureAwait(false);
+            await ReconcileDesiredAsync(desired, desiredPaths, ct).ConfigureAwait(false);
 
             // Update tracker.
             _state.Mounts = BuildMountStatuses(desired);
@@ -530,7 +648,7 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
         }
     }
 
-    private async Task ReconcileDesiredAsync(IReadOnlyList<RelayMountTarget> desired, HashSet<string> desiredPaths)
+    private async Task ReconcileDesiredAsync(IReadOnlyList<RelayMountTarget> desired, HashSet<string> desiredPaths, CancellationToken ct)
     {
         // Stop leases whose target path is no longer desired (unless validation-failed,
         // which we already keep unmounted).
@@ -560,6 +678,7 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
                     target.RootName, target.RootKind, target.TargetPath);
                 var lease = await DaemonMounter.StartLeaseAsync(target, _config, _client, _loggerFactory,
                     onUnexpectedStopped: () => _topologyCoalescer?.Trigger(),
+                    ct: ct,
                     snapshotStore: _snapshotStore)
                     .ConfigureAwait(false);
                 _leases[target.TargetPath] = lease;

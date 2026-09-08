@@ -199,7 +199,8 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
 
     private static IMetadataService Metadata(params IShokoSeries[] series) =>
         Proxy<IMetadataService>(
-            ("GetAllShokoSeries", (IEnumerable<IShokoSeries>)series)
+            ("GetAllShokoSeries", (IEnumerable<IShokoSeries>)series),
+            ("GetShokoSeriesByID", (Func<object?[], object?>)(args => series.FirstOrDefault(item => item.ID == (int)args[0]!)))
         );
 
     private static IShokoSeries Series(int id, AnimeType type, string title, params IShokoEpisode[] episodes) =>
@@ -316,7 +317,7 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
             if (ThrowingMembers.Contains(targetMethod.Name))
                 throw new InvalidOperationException($"Unexpected source probe: {targetMethod.Name}");
             if (Members.TryGetValue(targetMethod.Name, out var value))
-                return value;
+                return value is Func<object?[], object?> invokable ? invokable(args ?? []) : value;
             throw new InvalidOperationException($"Unexpected member read: {targetMethod.DeclaringType?.Name}.{targetMethod.Name}");
         }
     }

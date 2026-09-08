@@ -15,6 +15,7 @@ internal sealed class RelayMountLease : IAsyncDisposable
 {
     private readonly Func<CancellationToken, ValueTask> _stop;
     private readonly Action _invalidate;
+    private readonly Action<int>? _invalidateSeries;
     private readonly Action _stopped;
     private readonly Action? _daemonStopped;
     private readonly Action? _cleanupCompleted;
@@ -31,7 +32,8 @@ internal sealed class RelayMountLease : IAsyncDisposable
         Func<CancellationToken, ValueTask> stop,
         Action stopped,
         Action? daemonStopped = null,
-        Action? cleanupCompleted = null)
+        Action? cleanupCompleted = null,
+        Action<int>? invalidateSeries = null)
     {
         Target = target;
         _invalidate = invalidate;
@@ -39,11 +41,26 @@ internal sealed class RelayMountLease : IAsyncDisposable
         _stopped = stopped;
         _daemonStopped = daemonStopped;
         _cleanupCompleted = cleanupCompleted;
+        _invalidateSeries = invalidateSeries;
     }
 
     public void Invalidate()
     {
         if (Volatile.Read(ref _disposed) == 0)
+            _invalidate();
+    }
+
+    /// <summary>
+    /// Drops cached data for one series. Leases without targeted wiring (or lazy
+    /// data sources) fall back to the full invalidation.
+    /// </summary>
+    public void InvalidateSeries(int seriesId)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+        if (_invalidateSeries is { } targeted)
+            targeted(seriesId);
+        else
             _invalidate();
     }
 
@@ -144,12 +161,16 @@ internal sealed class RelayMountOperations
 /// <summary>Creates runtime mounts backed by the real Relay resolver and FUSE service.</summary>
 internal static class RelayMountOperationsFactory
 {
-    internal static RelayMountOperations Create(IMetadataService metadataService, ILoggerFactory loggerFactory) =>
+    internal static RelayMountOperations Create(
+        IMetadataService metadataService,
+        ILoggerFactory loggerFactory,
+        Shoko.Abstractions.Video.Services.IVideoService? videoService = null) =>
         new((target, configuration, manualOverrides, cancellationToken, stopped, daemonStopped, cleanupCompleted) =>
-            StartAsync(metadataService, loggerFactory, target, configuration, manualOverrides, cancellationToken, stopped, daemonStopped, cleanupCompleted));
+            StartAsync(metadataService, videoService, loggerFactory, target, configuration, manualOverrides, cancellationToken, stopped, daemonStopped, cleanupCompleted));
 
     private static async Task<RelayMountLease> StartAsync(
         IMetadataService metadataService,
+        Shoko.Abstractions.Video.Services.IVideoService? videoService,
         ILoggerFactory loggerFactory,
         RelayMountTarget target,
         FusePluginConfiguration configuration,
@@ -177,7 +198,9 @@ internal static class RelayMountOperationsFactory
                 MoveCommonSeriesTitlePrefixes = configuration.MoveCommonSeriesTitlePrefixes,
                 TmdbEpGroupNames = configuration.TmdbEpGroupNames,
                 ManualOverrideGroups = manualOverrides,
-            }
+                SeriesCacheTtl = target.ResolverOptions.SeriesCacheTtl,
+            },
+            videoService
         );
         var resolver = new ShokoPathResolver(
             dataSource,
@@ -218,7 +241,8 @@ internal static class RelayMountOperationsFactory
             },
             stopped,
             daemonStopped,
-            cleanupCompleted);
+            cleanupCompleted,
+            seriesId => resolver.InvalidateSeries(dataSource.MapToPrimarySeriesId(seriesId)));
         service.UnexpectedStopped += OnUnexpectedStopped;
         service.DaemonStopped += OnDaemonStoppedFromService;
         service.CleanupCompleted += OnCleanupCompletedFromService;

@@ -39,10 +39,12 @@ public sealed class RelayRuntime : BackgroundService
     private readonly ConcurrentDictionary<string, MountedLease> _pendingLeases = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _mountAttempts = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> _unexpectedStops = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<int, byte> _contentSeriesDirty = new();
     private readonly HashSet<string> _capabilityCodes = new(StringComparer.Ordinal);
     private RelayHealthStatus _status;
     private int _topologyDirty = 1;
     private int _contentDirty;
+    private int _contentFullDirty;
     private bool _subscribed;
     private IReadOnlyList<IReadOnlyList<int>> _lastValidOverrideGroups = [];
 
@@ -66,7 +68,7 @@ public sealed class RelayRuntime : BackgroundService
             metadataService,
             configurationProvider,
             applicationPaths,
-            RelayMountOperationsFactory.Create(metadataService, loggerFactory),
+            RelayMountOperationsFactory.Create(metadataService, loggerFactory, videoService),
             logger)
     {
     }
@@ -124,7 +126,14 @@ public sealed class RelayRuntime : BackgroundService
                 }
                 else if (Interlocked.Exchange(ref _contentDirty, 0) != 0)
                 {
-                    InvalidateMountedResolvers();
+                    if (Interlocked.Exchange(ref _contentFullDirty, 0) != 0)
+                        InvalidateMountedResolvers();
+                    else
+                    {
+                        var dirtySeries = DrainContentSeries();
+                        if (dirtySeries.Count > 0)
+                            InvalidateMountedResolversSeries(dirtySeries);
+                    }
                 }
             }
         }
@@ -406,6 +415,25 @@ public sealed class RelayRuntime : BackgroundService
         }
     }
 
+    private void InvalidateMountedResolversSeries(IReadOnlyList<int> seriesIds)
+    {
+        foreach (var mounted in _leases.Values.ToArray())
+        {
+            foreach (var seriesId in seriesIds)
+            {
+                try
+                {
+                    mounted.Lease.InvalidateSeries(seriesId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Relay resolver series invalidation failed for series {SeriesId}.", seriesId);
+                    AddCapability("CacheInvalidationFailed");
+                }
+            }
+        }
+    }
+
     private async Task StopOwnedLeasesAsync()
     {
         foreach (var (path, mounted) in _leases.ToArray())
@@ -579,7 +607,60 @@ public sealed class RelayRuntime : BackgroundService
         _subscribed = false;
     }
 
-    private void OnContent(object? sender, EventArgs _) => MarkDirty(fullReconcile: false);
+    private void OnContent(object? sender, EventArgs e)
+    {
+        // Content events carry the affected series when the payload links them;
+        // anything else (e.g. VideoFileDetected, unindexed files) gets the old
+        // full invalidation.
+        List<int>? seriesIds = null;
+        try
+        {
+            seriesIds = ExtractContentSeriesIds(e);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Relay content event payload could not be inspected; falling back to full invalidation.");
+            seriesIds = null;
+        }
+
+        MarkContentDirty(seriesIds);
+    }
+
+    private static List<int>? ExtractContentSeriesIds(EventArgs e) => e switch
+    {
+        // Subclasses (Hashed, FileRelocated) share the linked-series snapshot.
+        VideoFileEventArgs fileEvent => fileEvent.Series is { } series
+            ? series.Where(link => link is not null).Select(link => link.ID).ToList()
+            : [],
+        VideoReleaseSavedEventArgs saved => saved.Video?.Series is { } series
+            ? series.Where(link => link is not null).Select(link => link.ID).ToList()
+            : [],
+        VideoReleaseDeletedEventArgs deleted => deleted.Video?.Series is { } series
+            ? series.Where(link => link is not null).Select(link => link.ID).ToList()
+            : [],
+        _ => null,
+    };
+
+    private void MarkContentDirty(List<int>? seriesIds)
+    {
+        if (seriesIds is null || seriesIds.Count == 0)
+            Interlocked.Exchange(ref _contentFullDirty, 1);
+        else
+            foreach (var id in seriesIds)
+                _contentSeriesDirty.TryAdd(id, 0);
+        Interlocked.Exchange(ref _contentDirty, 1);
+        Signal();
+    }
+
+    private List<int> DrainContentSeries()
+    {
+        // TryRemove per key so ids added while draining survive for the next pass.
+        var ids = new List<int>();
+        foreach (var id in _contentSeriesDirty.Keys.ToArray())
+            if (_contentSeriesDirty.TryRemove(id, out _))
+                ids.Add(id);
+        return ids;
+    }
 
     private void OnTopology(object? sender, EventArgs _) => MarkDirty(fullReconcile: true);
 
@@ -750,6 +831,7 @@ public sealed class RelayRuntime : BackgroundService
                     target.ResolverOptions.MoviesAsTv,
                     target.ResolverOptions.StandaloneMovies,
                     target.ResolverOptions.CacheTtl,
+                    target.ResolverOptions.SeriesCacheTtl,
                     target.ResolverOptions.IncludeMovieExtras,
                 },
             },

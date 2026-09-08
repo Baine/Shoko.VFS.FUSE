@@ -106,10 +106,11 @@ static async Task<int> RunDryRunAsync(string[] args)
 }
 
 // ---------------------------------------------------------------------------
-// Warmup: connect, login, start SignalR + availability monitor, load any
-// persisted snapshot, run the full startup reconcile, persist snapshots +
-// clean-shutdown marker, exit. Useful as a pre-deploy cache prime or a
-// scheduled refresh that does not keep the daemon process alive.
+// Warmup: connect, login, then aggregate + validate + persist one snapshot per
+// managed folder (no FUSE mounts; Tv/Movie targets of a folder share one
+// aggregation). Snapshots are persisted progressively, so Ctrl+C keeps all
+// finished folders. Exit; the next daemon start loads the snapshots and skips
+// the cold aggregation.
 // ---------------------------------------------------------------------------
 static async Task<int> RunWarmupAsync(string[] args)
 {
@@ -144,7 +145,7 @@ static async Task<int> RunWarmupAsync(string[] args)
     try
     {
         await daemon.WarmupAsync(cts.Token).ConfigureAwait(false);
-        Console.WriteLine("Warmup complete; per-mount snapshots + clean-shutdown marker persisted.");
+        Console.WriteLine("Warmup complete; per-folder snapshots + clean-shutdown markers persisted.");
         Console.WriteLine("Next normal daemon start will load the snapshot and skip the cold aggregation.");
         return 0;
     }
@@ -165,7 +166,7 @@ static async Task<int> RunWarmupAsync(string[] args)
     }
     finally
     {
-        // DisposeAsync flushes per-mount snapshots + clean-shutdown marker.
+        // Snapshots were already persisted progressively during warmup.
         await daemon.DisposeAsync().ConfigureAwait(false);
     }
 }

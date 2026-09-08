@@ -93,6 +93,12 @@ public sealed class FusePluginConfiguration : IConfiguration, IConfigurationWith
     /// <summary>Negative entry cache timeout in seconds.</summary>
     public double NegativeTimeout { get; set; } = 0.5;
 
+    /// <summary>
+    /// Minutes a lazily materialized per-series subtree may serve before it is refetched
+    /// on next access (0 disables subtree caching). Default: <c>5</c>.
+    /// </summary>
+    public double SeriesCacheTtlMinutes { get; set; } = 5;
+
     public static IReadOnlyDictionary<string, IReadOnlyList<string>> Validate(
         FusePluginConfiguration config,
         IConfigurationService configurationService,
@@ -105,6 +111,8 @@ public sealed class FusePluginConfiguration : IConfiguration, IConfigurationWith
             errors[nameof(EntryTimeout)] = ["EntryTimeout must be finite and greater than or equal to zero."];
         if (!double.IsFinite(config.NegativeTimeout) || config.NegativeTimeout < 0)
             errors[nameof(NegativeTimeout)] = ["NegativeTimeout must be finite and greater than or equal to zero."];
+        if (!double.IsFinite(config.SeriesCacheTtlMinutes) || config.SeriesCacheTtlMinutes < 0 || config.SeriesCacheTtlMinutes > 525600)
+            errors[nameof(SeriesCacheTtlMinutes)] = ["SeriesCacheTtlMinutes must be between 0 and a year in minutes."];
 
         // uint range is implicit; just guard against the impossible upper bound (0xFFFFFFFF).
         if (config.FuseMountUid == uint.MaxValue)

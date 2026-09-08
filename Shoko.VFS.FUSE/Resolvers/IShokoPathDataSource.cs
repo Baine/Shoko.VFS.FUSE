@@ -16,6 +16,24 @@ public interface IShokoPathDataSource
 }
 
 /// <summary>
+/// Optional lazy data source. When implemented, the resolver publishes a
+/// structure-only snapshot immediately (fast) and materializes each series
+/// subtree on first access via GetSeriesData. Structure entries carry
+/// series-level data only; their Mappings may be empty.
+/// </summary>
+public interface ILazyShokoPathDataSource
+{
+    /// <summary>Series-level layout: one SeriesData per series in scope, with empty (or partial) Mappings.</summary>
+    IReadOnlyList<SeriesData> GetSeriesStructure();
+
+    /// <summary>Full per-series data (Mappings + Extras) for one series. Adapters cache per series ID. Return null if the series has no data.</summary>
+    SeriesData? GetSeriesData(int seriesId);
+
+    /// <summary>Drop cached data for one series (or all when null). Next GetSeriesData refetches.</summary>
+    void Invalidate(int? seriesId);
+}
+
+/// <summary>
 /// A series and its pre-resolved episode/file mappings.
 /// </summary>
 /// <param name="SeriesId">The Shoko series identifier.</param>

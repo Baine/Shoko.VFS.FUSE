@@ -96,14 +96,35 @@ public sealed class ShokoRestClient
         => GetJsonOrNullAsync<ManagedFolderDto>($"api/v3/ManagedFolder/{managedFolderId}");
 
 /// <summary>
-/// <c>GET /api/v3/ManagedFolder/{id}/File?pageSize=0&amp;include=XRefs</c> —
-/// every file in the managed folder, with per-series cross-reference groups.
+/// <c>GET /api/v3/ManagedFolder/{id}/File?pageSize=10000&amp;page={n}&amp;include=XRefs</c> —
+/// every file in the managed folder, with per-series cross-reference groups. Fetched in
+/// parallel pages (the server caps pageSize at 10000; pagination is post-materialization but
+/// caps transfer/parse per request and lets pages run concurrently).
 /// </summary>
 public async Task<IReadOnlyList<FileDto>> GetManagedFolderFilesAsync(int managedFolderId)
 {
-    var result = await GetJsonOrNullAsync<ListResult<FileDto>>(
-        $"api/v3/ManagedFolder/{managedFolderId}/File?pageSize=0&include=XRefs");
-    return result?.List ?? [];
+    const int pageSize = 10000;
+    var first = await GetJsonOrNullAsync<ListResult<FileDto>>(
+        $"api/v3/ManagedFolder/{managedFolderId}/File?pageSize={pageSize}&page=1&include=XRefs");
+    if (first is null || first.List.Count == 0 || first.Total <= pageSize)
+        return first?.List ?? [];
+
+    // Total can shift while paging (server-side inserts/deletes); a duplicate or gap in the
+    // concatenated result is self-healing for our consumers (seed sets, xref indexes).
+    int pageCount = (first.Total + pageSize - 1) / pageSize;
+    var pages = new IReadOnlyList<FileDto>?[pageCount];
+    pages[0] = first.List;
+    await Parallel.ForEachAsync(
+        Enumerable.Range(2, pageCount - 1),
+        new ParallelOptions { MaxDegreeOfParallelism = 4 },
+        async (page, _) =>
+        {
+            var result = await GetJsonOrNullAsync<ListResult<FileDto>>(
+                $"api/v3/ManagedFolder/{managedFolderId}/File?pageSize={pageSize}&page={page}&include=XRefs");
+            pages[page - 1] = result?.List ?? [];
+        }).ConfigureAwait(false);
+
+    return pages.Where(page => page is not null).SelectMany(page => page!).ToList();
 }
 
     /// <summary>
@@ -124,7 +145,10 @@ public async Task<IReadOnlyList<FileDto>> GetManagedFolderFilesAsync(int managed
             page++;
         }
 
-        return all;
+        // The series listing is not sorted by a unique key, so a row can shift between
+        // pages mid-enumeration (import in flight, unstable tie order) and appear twice.
+        // Same self-healing contract as GetManagedFolderFilesAsync: dedupe by series ID.
+        return all.DistinctBy(series => series.IDs.ID).ToList();
     }
 
     /// <summary><c>GET /api/v3/Series/{id}?includeDataFrom=AniDB,TMDB</c>.</summary>
@@ -142,6 +166,20 @@ public async Task<IReadOnlyList<FileDto>> GetManagedFolderFilesAsync(int managed
             "api/v3/Series/" + seriesId +
             "/Episode?pageSize=0&includeHidden=true&includeMissing=true&includeUnaired=true" +
             "&includeDataFrom=AniDB,TMDB&includeFiles=true&includeXRefs=true");
+        return result?.List ?? [];
+    }
+
+    /// <summary>
+    /// <c>GET /api/v3/Series/{seriesId}/Episode</c> — bare episode DTOs (IDs, IndexNumber; the
+    /// AniDB type/number only when the server populates them without includeDataFrom). Much
+    /// cheaper server-side than <see cref="GetSeriesEpisodesAsync"/>; used by the structure
+    /// pass to pick each movie series' main episode id (folder naming only).
+    /// </summary>
+    public async Task<IReadOnlyList<ShokoEpisodeDto>> GetSeriesEpisodesLiteAsync(int seriesId)
+    {
+        var result = await GetJsonOrNullAsync<ListResult<ShokoEpisodeDto>>(
+            "api/v3/Series/" + seriesId +
+            "/Episode?pageSize=0&includeHidden=true&includeMissing=true&includeUnaired=true");
         return result?.List ?? [];
     }
 

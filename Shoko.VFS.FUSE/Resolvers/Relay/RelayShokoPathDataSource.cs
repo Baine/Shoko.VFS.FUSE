@@ -5,6 +5,8 @@ using Shoko.Abstractions.Metadata.Services;
 using Shoko.Abstractions.Metadata.Shoko;
 using Shoko.Abstractions.Video;
 using Shoko.Abstractions.Video.Enums;
+using Shoko.Abstractions.Video.Services;
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 
 namespace Shoko.VFS.FUSE.Resolvers.Relay;
@@ -25,6 +27,7 @@ public sealed record RelayPathDataSourceOptions(int ManagedFolderId, string Mana
     public bool MoveCommonSeriesTitlePrefixes { get; init; } = true;
     public bool TmdbEpGroupNames { get; init; } = true;
     public IReadOnlyList<IReadOnlyList<int>> ManualOverrideGroups { get; init; } = [];
+    public TimeSpan SeriesCacheTtl { get; init; } = TimeSpan.FromMinutes(5);
 
     public DropFolderType ManagedFolderDropFolderType
     {
@@ -33,7 +36,7 @@ public sealed record RelayPathDataSourceOptions(int ManagedFolderId, string Mana
     }
 }
 
-public sealed class RelayShokoPathDataSource : IShokoPathDataSource
+public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoPathDataSource
 {
     private static readonly Regex s_seriesPrefixRegex = new(@"^(Gekijou ?(?:ban(?: 3D)?|Tanpen|Remix Ban|Henshuuban|Soushuuhen)|Eiga|OVA) (.*$)", RegexOptions.Compiled);
     private static readonly Regex s_defaultTitleRegex = new(@"^(Episode|Volume|Special|Short|(Short )?Movie) [S0]?[1-9][0-9]*$", RegexOptions.Compiled);
@@ -47,12 +50,18 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource
         ["Behind The Scenes", "Deleted Scenes", "Featurettes", "Interviews", "Scenes", "Shorts", "Trailers", "Other"];
 
     private readonly IMetadataService _metadataService;
+    private readonly IVideoService? _videoService;
     private readonly RelayPathDataSourceOptions _options;
     private readonly int _managedFolderId;
     private readonly string _managedFolderRoot;
     private readonly StringComparison _pathComparison;
+    private readonly object _structureGate = new();
+    private readonly ConcurrentDictionary<int, SeriesCacheEntry> _seriesCache = new();
+    private int _lastSeriesCount;
+    private volatile IReadOnlyDictionary<int, int> _primaryBySeriesId = new Dictionary<int, int>();
+    private volatile IReadOnlyDictionary<int, IReadOnlyList<int>> _membersByPrimary = new Dictionary<int, IReadOnlyList<int>>();
 
-    public RelayShokoPathDataSource(IMetadataService metadataService, RelayPathDataSourceOptions options)
+    public RelayShokoPathDataSource(IMetadataService metadataService, RelayPathDataSourceOptions options, IVideoService? videoService = null)
     {
         _metadataService = metadataService ?? throw new ArgumentNullException(nameof(metadataService));
         if (options is null)
@@ -76,25 +85,266 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource
 
         _managedFolderId = options.ManagedFolderId;
         _options = options;
+        _videoService = videoService;
         _pathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
     }
+
+    /// <summary>
+    /// Maps any series in a consolidation group to the group's primary series id
+    /// (the id the resolver routes subtrees by). Unknown ids map to themselves.
+    /// </summary>
+    public int MapToPrimarySeriesId(int seriesId) =>
+        _primaryBySeriesId.GetValueOrDefault(seriesId, seriesId);
 
     public IReadOnlyList<SeriesData> GetAllSeries()
     {
         if (!IsEligibleManagedFolder())
             return [];
 
-        var allSeries = (_metadataService.GetAllShokoSeries() ?? Array.Empty<IShokoSeries>()).ToArray();
-        var localSeedIds = allSeries
+        var allSeries = LoadAllSeries();
+        var (seedIds, verifiedEmpty) = CollectSeedSeriesIds(allSeries);
+        if (seedIds.Count == 0)
+        {
+            ThrowIfTransientEmpty(0, verifiedEmpty, "seed enumeration (file listing and series walk) returned no series");
+            return [];
+        }
+
+        var closedSeries = FilterClosedSeries(allSeries, seedIds);
+        var rawSeries = closedSeries
+            .Select(ExtractSeries)
+            .ToList();
+        ThrowIfTransientEmpty(rawSeries.Count, verified: false, "grouping produced no series despite non-empty seeds");
+        var groups = BuildGroups(rawSeries);
+        PublishGroupMaps(groups);
+        var merged = groups.Select(group => group.Data).ToList();
+
+        // Discover AnimeThemes Theme.mp3 files written by ShokoRelay's AnimeThemesMp3Generator
+        // into the non-VFS source folders, and surface them as series-folder-root extras.
+        // Mirrors the host daemon's ShokoRelayDataSource.DiscoverThemeExtras; the resolver
+        // renders them at <seriesFolder>/Theme.mp3. Restricted to closedSeries so the same
+        // probe discipline applies as the main aggregation path.
+        var extrasBySeries = DiscoverThemeExtras(closedSeries);
+        if (extrasBySeries.Count == 0)
+            return merged;
+        return merged
+            .Select(s => extrasBySeries.TryGetValue(s.SeriesId, out var extra)
+                ? s with { Extras = new[] { extra } }
+                : s)
+            .ToList();
+    }
+
+    /// <summary>
+    /// A managed folder that resolved non-empty before must not flap to empty when
+    /// Shoko transiently reports no files/series (DB hiccup, import in flight, video
+    /// entity not yet loadable). Throwing keeps the last published snapshot alive —
+    /// the resolver's refresh loop retains the previous snapshot on exceptions and
+    /// retries after its backoff — instead of publishing an empty snapshot that
+    /// empties every directory in the mount.
+    /// </summary>
+    /// <param name="count">Series/groups resolved in this pass.</param>
+    /// <param name="verified">True when the API independently confirmed the folder is
+    /// genuinely empty (file listing and series walk agree, library non-empty).</param>
+    /// <param name="detail">Diagnostic text included in the exception when transient.</param>
+    private void ThrowIfTransientEmpty(int count, bool verified, string detail)
+    {
+        if (count > 0)
+        {
+            Volatile.Write(ref _lastSeriesCount, count);
+            return;
+        }
+
+        if (verified)
+        {
+            Volatile.Write(ref _lastSeriesCount, 0);
+            return;
+        }
+
+        int last = Volatile.Read(ref _lastSeriesCount);
+        if (last > 0)
+            throw new InvalidOperationException(
+                $"Relay source for managed folder {_managedFolderId} transiently resolved 0 series (last known: {last}; {detail}); keeping the previous snapshot.");
+    }
+
+    /// <summary>
+    /// Structure-only pass: series/movie directory nodes with empty mappings, so the
+    /// resolver can publish the mount layout without materializing any TV series'
+    /// episodes/videos/files. Movie-closure groups carry exactly one real main mapping
+    /// (the resolver skips source-less mappings when building movie folders, so the
+    /// episode-ID folder would otherwise never appear for routing).
+    /// </summary>
+    public IReadOnlyList<SeriesData> GetSeriesStructure()
+    {
+        lock (_structureGate)
+        {
+            _seriesCache.Clear();
+            if (!IsEligibleManagedFolder())
+            {
+                PublishGroupMaps([]);
+                return [];
+            }
+
+            var allSeries = LoadAllSeries();
+            var (seedIds, verifiedEmpty) = CollectSeedSeriesIds(allSeries);
+            if (seedIds.Count == 0)
+            {
+                ThrowIfTransientEmpty(0, verifiedEmpty, "seed enumeration (file listing and series walk) returned no series");
+                PublishGroupMaps([]);
+                return [];
+            }
+
+            var closedSeries = FilterClosedSeries(allSeries, seedIds);
+            var byId = closedSeries.ToDictionary(series => series.ID);
+            var shellInputs = closedSeries
+                .Select(series => BuildGroupingInput(ExtractSeriesShell(series)))
+                .ToList();
+            var groups = BuildGroupsFromInputs(shellInputs);
+            ThrowIfTransientEmpty(groups.Count, verified: false, "grouping produced no groups despite non-empty seeds");
+            PublishGroupMaps(groups);
+
+            var result = new List<SeriesData>(groups.Count);
+            foreach (var group in groups)
+            {
+                var data = group.Data;
+                if (data.IsMovie)
+                    data = data with { Mappings = MovieStructureMappings(group.SeriesIds, byId) };
+                result.Add(data);
+            }
+
+            return result;
+        }
+    }
+
+    public SeriesData? GetSeriesData(int seriesId)
+    {
+        if (_seriesCache.TryGetValue(seriesId, out var cached) && IsFresh(cached))
+            return cached.Data;
+
+        var data = LoadSeriesFromShoko(seriesId);
+        _seriesCache[seriesId] = new SeriesCacheEntry(data, DateTimeOffset.UtcNow);
+        return data;
+    }
+
+    public void Invalidate(int? seriesId)
+    {
+        if (seriesId is not int id)
+        {
+            _seriesCache.Clear();
+            return;
+        }
+
+        _seriesCache.TryRemove(id, out _);
+        if (_primaryBySeriesId.TryGetValue(id, out var primary))
+            _seriesCache.TryRemove(primary, out _);
+    }
+
+    private SeriesData? LoadSeriesFromShoko(int seriesId)
+    {
+        var memberIds = _membersByPrimary.TryGetValue(seriesId, out var members) ? members : new[] { seriesId };
+        var loaded = new List<IShokoSeries>(memberIds.Count);
+        foreach (var id in memberIds)
+        {
+            if (_metadataService.GetShokoSeriesByID(id) is { } series)
+                loaded.Add(series);
+        }
+
+        if (loaded.Count == 0)
+            return null;
+
+        var data = loaded.Count == 1
+            ? RelayMappingProjector.Project(ExtractSeries(loaded[0]))
+            : BuildGroups(loaded.Select(ExtractSeries).ToList()).First().Data;
+
+        var extrasBySeries = DiscoverThemeExtras(loaded);
+        if (extrasBySeries.TryGetValue(seriesId, out var theme))
+            data = data with { Extras = [theme] };
+        return data;
+    }
+
+    private IReadOnlyList<EpisodeData> MovieStructureMappings(IReadOnlyList<int> memberIds, Dictionary<int, IShokoSeries> byId)
+    {
+        var raws = memberIds
+            .Where(id => byId.ContainsKey(id))
+            .Select(id => ExtractSeries(byId[id]))
+            .ToList();
+        var mappings = (raws.Count == 1
+                ? [RelayMappingProjector.Project(raws[0])]
+                : BuildGroups(raws).Select(group => group.Data))
+            .SelectMany(series => series.Mappings ?? []);
+        var main = mappings.FirstOrDefault(mapping => mapping.IsMain && !string.IsNullOrWhiteSpace(mapping.SourcePath))
+            ?? mappings.FirstOrDefault(mapping => !string.IsNullOrWhiteSpace(mapping.SourcePath));
+        return main is null ? [] : [main];
+    }
+
+    private bool IsFresh(SeriesCacheEntry entry) =>
+        _options.SeriesCacheTtl > TimeSpan.Zero
+        && DateTimeOffset.UtcNow - entry.CompletedAt < _options.SeriesCacheTtl;
+
+    private List<IShokoSeries> LoadAllSeries() =>
+        (_metadataService.GetAllShokoSeries() ?? Array.Empty<IShokoSeries>()).ToList();
+
+    /// <summary>
+    /// Series with at least one indexed file in the managed folder. Prefers the cheap
+    /// per-folder file listing (one query plus per-video cross-references) over walking
+    /// every series' episodes/videos/files; falls back to the full scan when no
+    /// IVideoService was supplied — and also when the file listing comes back empty, so
+    /// an empty result is verified against the independent series-walk path before it
+    /// is trusted (Shoko can transiently report no files during an import or DB hiccup).
+    /// Verified-empty requires the walk to agree while the series library is non-empty.
+    /// </summary>
+    private (HashSet<int> Ids, bool VerifiedEmpty) CollectSeedSeriesIds(IReadOnlyList<IShokoSeries> allSeries)
+    {
+        if (_videoService is { } videoService)
+        {
+            var folder = (videoService.GetAllManagedFolders() ?? Array.Empty<IManagedFolder>())
+                .FirstOrDefault(candidate => candidate.ID == _managedFolderId);
+            if (folder is not null)
+            {
+                var ids = new HashSet<int>();
+                var seenVideos = new HashSet<int>();
+                foreach (var file in videoService.GetVideoFilesInManagedFolder(folder) ?? Array.Empty<IVideoFile>())
+                {
+                    if (file.ManagedFolderID != _managedFolderId)
+                        continue;
+
+                    IVideo? video;
+                    try
+                    {
+                        video = file.Video;
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or NullReferenceException)
+                    {
+                        continue;
+                    }
+
+                    if (video is null || !seenVideos.Add(video.ID))
+                        continue;
+
+                    foreach (var series in video.Series ?? Array.Empty<IShokoSeries>())
+                        ids.Add(series.ID);
+                }
+
+                if (ids.Count > 0)
+                    return (ids, false);
+
+                var walkIds = CollectSeedIdsBySeriesWalk(allSeries);
+                return (walkIds, walkIds.Count == 0 && allSeries.Count > 0);
+            }
+        }
+
+        return (CollectSeedIdsBySeriesWalk(allSeries), false);
+    }
+
+    private HashSet<int> CollectSeedIdsBySeriesWalk(IReadOnlyList<IShokoSeries> allSeries) =>
+        allSeries
             .Where(series => (series.Episodes ?? Array.Empty<IShokoEpisode>())
                 .Any(episode => (episode.Videos ?? Array.Empty<IVideo>())
                     .Any(video => (video.Files ?? Array.Empty<IVideoFile>())
                         .Any(file => file.ManagedFolderID == _managedFolderId))))
             .Select(series => series.ID)
             .ToHashSet();
-        if (localSeedIds.Count == 0)
-            return [];
 
+    private List<IShokoSeries> FilterClosedSeries(IReadOnlyList<IShokoSeries> allSeries, HashSet<int> localSeedIds)
+    {
         bool enforceTmdbNumbering = _options.TmdbEpNumbering || _options.MergeTmdbSeries;
         var manualOverrides = enforceTmdbNumbering ? _options.ManualOverrideGroups : [];
         var groupingMetadata = allSeries
@@ -111,32 +361,44 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource
             _options.MergeTmdbSeries,
             manualOverrides
         );
-        var closedSeries = allSeries
+        return allSeries
             .Where(series => groupClosure.Contains(series.ID))
             .ToList();
-        var rawSeries = closedSeries
-            .Select(ExtractSeries)
-            .ToList();
-        var projected = rawSeries.Select(RelayMappingProjector.Project).ToList();
-        var groupingInputs = rawSeries
-            .Zip(projected, (raw, data) => new RelaySeriesGroupingInput(data, raw.AnidbAnimeId, raw.AirDate, raw.TmdbSeriesId))
-            .ToArray();
-        var merged = RelaySeriesGrouper.Merge(groupingInputs, _options.MergeTmdbSeries, manualOverrides);
-
-        // Discover AnimeThemes Theme.mp3 files written by ShokoRelay's AnimeThemesMp3Generator
-        // into the non-VFS source folders, and surface them as series-folder-root extras.
-        // Mirrors the host daemon's ShokoRelayDataSource.DiscoverThemeExtras; the resolver
-        // renders them at <seriesFolder>/Theme.mp3. Restricted to closedSeries so the same
-        // probe discipline applies as the main aggregation path.
-        var extrasBySeries = DiscoverThemeExtras(closedSeries);
-        if (extrasBySeries.Count == 0)
-            return merged;
-        return merged
-            .Select(s => extrasBySeries.TryGetValue(s.SeriesId, out var extra)
-                ? s with { Extras = new[] { extra } }
-                : s)
-            .ToList();
     }
+
+    private IReadOnlyList<RelaySeriesGroup> BuildGroups(IReadOnlyList<RelayRawSeries> rawSeries) =>
+        BuildGroupsFromInputs(BuildGroupingInputs(rawSeries));
+
+    private IReadOnlyList<RelaySeriesGroup> BuildGroupsFromInputs(IReadOnlyList<RelaySeriesGroupingInput> groupingInputs) =>
+        RelaySeriesGrouper.Group(groupingInputs, _options.MergeTmdbSeries, EffectiveManualOverrides());
+
+    private static IReadOnlyList<RelaySeriesGroupingInput> BuildGroupingInputs(IReadOnlyList<RelayRawSeries> rawSeries) =>
+        rawSeries
+            .Select(raw => BuildGroupingInput(raw))
+            .ToList();
+
+    private static RelaySeriesGroupingInput BuildGroupingInput(RelayRawSeries raw) =>
+        new(RelayMappingProjector.Project(raw), raw.AnidbAnimeId, raw.AirDate, raw.TmdbSeriesId);
+
+    private void PublishGroupMaps(IReadOnlyList<RelaySeriesGroup> groups)
+    {
+        var primaryBySeriesId = new Dictionary<int, int>();
+        var membersByPrimary = new Dictionary<int, IReadOnlyList<int>>();
+        foreach (var group in groups)
+        {
+            membersByPrimary[group.PrimarySeriesId] = group.SeriesIds;
+            foreach (var id in group.SeriesIds)
+                primaryBySeriesId[id] = group.PrimarySeriesId;
+        }
+
+        _membersByPrimary = membersByPrimary;
+        _primaryBySeriesId = primaryBySeriesId;
+    }
+
+    private IReadOnlyList<IReadOnlyList<int>> EffectiveManualOverrides() =>
+        _options.TmdbEpNumbering || _options.MergeTmdbSeries ? _options.ManualOverrideGroups : [];
+
+    private sealed record SeriesCacheEntry(SeriesData? Data, DateTimeOffset CompletedAt);
 
     /// <summary>
     /// Probes every distinct source-series folder in the managed folder for a Theme.mp3 file
@@ -202,7 +464,7 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource
         relative = relative.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         if (relative.Length == 0) return null;
 
-        string parent = Path.GetDirectoryName(relative);
+        string? parent = Path.GetDirectoryName(relative);
         if (string.IsNullOrEmpty(parent)) return null;
 
         try
@@ -220,14 +482,8 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource
     private RelayRawSeries ExtractSeries(IShokoSeries series)
     {
         bool enforceTmdbNumbering = _options.TmdbEpNumbering || _options.MergeTmdbSeries;
-        var tmdbShows = series.TmdbShows ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbShow>();
-        var preferredOrdering = tmdbShows.FirstOrDefault()?.PreferredOrdering;
+        var preferredOrdering = (series.TmdbShows ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbShow>()).FirstOrDefault()?.PreferredOrdering;
         string? rawPreferredOrderingId = preferredOrdering?.OrderingID;
-        string? preferredOrderingId = rawPreferredOrderingId;
-        if (tmdbShows.FirstOrDefault() is { } tmdbShow
-            && string.Equals(preferredOrderingId, tmdbShow.ID.ToString(), StringComparison.OrdinalIgnoreCase))
-            preferredOrderingId = null;
-        var tmdbMovies = series.TmdbMovies ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbMovie>();
         string displayTitle = ResolveSeriesTitle(series);
         var videos = new Dictionary<int, RelayRawVideo>();
         var episodes = new List<RelayRawEpisode>();
@@ -264,6 +520,27 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource
                 TmdbEpisodes = ExtractTmdbEpisodes(episode, enforceTmdbNumbering && !string.IsNullOrWhiteSpace(rawPreferredOrderingId))
             };
         }
+
+        return BuildSeriesModel(series, displayTitle, episodes);
+    }
+
+    /// <summary>
+    /// Series-level fields only (no episode/video/file traversal) for the structure pass.
+    /// </summary>
+    private RelayRawSeries ExtractSeriesShell(IShokoSeries series) =>
+        BuildSeriesModel(series, ResolveSeriesTitle(series), []);
+
+    private RelayRawSeries BuildSeriesModel(IShokoSeries series, string displayTitle, List<RelayRawEpisode> episodes)
+    {
+        bool enforceTmdbNumbering = _options.TmdbEpNumbering || _options.MergeTmdbSeries;
+        var tmdbShows = series.TmdbShows ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbShow>();
+        var preferredOrdering = tmdbShows.FirstOrDefault()?.PreferredOrdering;
+        string? rawPreferredOrderingId = preferredOrdering?.OrderingID;
+        string? preferredOrderingId = rawPreferredOrderingId;
+        if (tmdbShows.FirstOrDefault() is { } tmdbShow
+            && string.Equals(preferredOrderingId, tmdbShow.ID.ToString(), StringComparison.OrdinalIgnoreCase))
+            preferredOrderingId = null;
+        var tmdbMovies = series.TmdbMovies ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbMovie>();
 
         return new RelayRawSeries(series.ID, series.Type, displayTitle, episodes)
         {

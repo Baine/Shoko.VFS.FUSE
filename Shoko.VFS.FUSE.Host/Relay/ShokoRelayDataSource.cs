@@ -1,14 +1,19 @@
-// REST-based data source for the Relay path resolver.
+// REST-based lazy data source for the Relay path resolver.
 //
 // Replicates the aggregation chain of the in-process RelayShokoPathDataSource
-// (Shoko.VFS.FUSE/Resolvers/Relay/RelayShokoPathDataSource.cs) over the Shoko
-// Server REST API instead of IMetadataService:
+// (Shoko.VFS.FUSE/Resolvers/RelayShokoPathDataSource.cs) over the Shoko
+// Server REST API instead of IMetadataService — split into a cheap structure
+// pass (series-level nodes only) plus per-series subtrees fetched on demand:
 //
-//   1. GET /api/v3/ManagedFolder/{id}/File?include=XRefs  -> series seed ids
+// Structure pass (GetSeriesStructure):
+//   1. GET /api/v3/ManagedFolder/{id}/File?pageSize=10000&page={n}&include=XRefs -> seed ids
 //   2. GET /api/v3/Series?includeDataFrom=AniDB,TMDB      -> grouping metadata for all series
-//   3. RelaySeriesGrouper.GetGroupClosure                 -> series closure around the seeds
-//   4. GET /api/v3/Series/{id}/Episode (AniDB+TMDB+Files+XRefs) -> RelayRaw* extraction
-//   5. RelayMappingProjector.Project + RelaySeriesGrouper.Merge -> SeriesData
+//   3. RelaySeriesGrouper.GetGroupClosure + Group         -> closed series with empty Mappings
+//   4. GET /api/v3/Series/{id}/Episode (bare, per movie)  -> main episode id for folder names
+//
+// Per-series pass (GetSeriesData, cached + invalidated per series):
+//   5. GET /api/v3/Series/{id}/Episode (AniDB+TMDB+Files+XRefs) -> RelayRaw* extraction
+//   6. RelayMappingProjector.Project + RelaySeriesGrouper.Merge -> full SeriesData (+Theme.mp3)
 //
 // Title/coordinate semantics mirror the plugin 1:1, including the TMDB
 // alternate-ordering handling (see ExtractTmdbEpisodesAsync).
@@ -26,7 +31,7 @@ using AbstractionsDropFolderType = Shoko.Abstractions.Video.Enums.DropFolderType
 
 namespace Shoko.VFS.FUSE.Resolvers.Relay;
 
-public sealed class ShokoRelayDataSource : IShokoPathDataSource, IDisposable
+public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathDataSource, IDisposable
 {
     private static readonly Regex s_seriesPrefixRegex = new(@"^(Gekijou ?(?:ban(?: 3D)?|Tanpen|Remix Ban|Henshuuban|Soushuuhen)|Eiga|OVA) (.*$)", RegexOptions.Compiled);
     private static readonly Regex s_defaultTitleRegex = new(@"^(Episode|Volume|Special|Short|(Short )?Movie) [S0]?[1-9][0-9]*$", RegexOptions.Compiled);
@@ -42,6 +47,28 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, IDisposable
     private readonly string _managedFolderRoot;
     private readonly StringComparison _pathComparison;
     private readonly DataSourceCache? _cache;
+    private readonly TimeSpan _ttl;
+    private readonly int _maxDegree;
+    private readonly FileSnapshotStore? _snapshotStore;
+    private readonly string? _snapshotKey;
+
+    /// <summary>Warm per-series data keyed by PRIMARY series id (merged groups share one entry).</summary>
+    private readonly ConcurrentDictionary<int, SeriesCacheEntry> _seriesCache = new();
+
+    /// <summary>In-flight per-series builds for single-flight outside the resolver's own per-series gate.</summary>
+    private readonly ConcurrentDictionary<int, Task<SeriesData?>> _seriesFetches = new();
+
+    /// <summary>Primary series id → all member ids of its group (from the last structure pass).</summary>
+    private readonly ConcurrentDictionary<int, IReadOnlyList<int>> _groupMembers = new();
+
+    /// <summary>Any member id → primary series id (from the last structure pass).</summary>
+    private readonly ConcurrentDictionary<int, int> _memberToPrimary = new();
+
+    /// <summary>File id → cross-referenced series ids, from the structure pass' file listing. Immutable swap.</summary>
+    private volatile IReadOnlyDictionary<int, int[]> _fileSeriesIndex = new Dictionary<int, int[]>();
+
+    /// <summary>Last non-empty structure-pass series count, to detect flapping to empty.</summary>
+    private int _lastSeriesCount;
 
     public ShokoRelayDataSource(ShokoRestClient client, RelayPathDataSourceOptions options,
         TimeSpan cacheTtl = default, int maxDegree = 4,
@@ -69,22 +96,92 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, IDisposable
 
         _managedFolderId = options.ManagedFolderId;
         _options = options;
+        _ttl = cacheTtl;
+        _maxDegree = Math.Max(1, maxDegree);
+        _snapshotStore = snapshotStore;
+        _snapshotKey = snapshotKey;
+        if (snapshotStore is not null && string.IsNullOrWhiteSpace(snapshotKey))
+            throw new ArgumentException("snapshotKey required when snapshotStore is set.", nameof(snapshotKey));
         _pathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        // The cache now fronts the cheap structure pass only; per-series data has its own
+        // per-id cache below. Snapshot persistence is handled directly against the store
+        // (it persists structure + warm per-series entries combined).
         if (cacheTtl > TimeSpan.Zero)
-            _cache = new DataSourceCache(GetAllSeriesCoreAsync, cacheTtl, maxDegree, snapshotStore, snapshotKey);
+            _cache = new DataSourceCache(GetSeriesStructureCoreAsync, cacheTtl, maxDegree);
     }
 
     /// <summary>Synchronous entry point required by <see cref="IShokoPathDataSource"/>.</summary>
     public IReadOnlyList<SeriesData> GetAllSeries()
         => GetAllSeriesAsync().GetAwaiter().GetResult();
 
-    public Task<IReadOnlyList<SeriesData>> GetAllSeriesAsync()
-        => _cache is not null
-            ? _cache.GetAsync()
-            : GetAllSeriesCoreAsync();
+    /// <summary>Structure entries plus all warm per-series entries (appended), the snapshot-store shape.</summary>
+    public async Task<IReadOnlyList<SeriesData>> GetAllSeriesAsync()
+    {
+        var structure = _cache is not null
+            ? await _cache.GetAsync().ConfigureAwait(false)
+            : await GetSeriesStructureCoreAsync().ConfigureAwait(false);
+        return CombineWithWarmEntries(structure);
+    }
+
+    #region ILazyShokoPathDataSource
+
+    /// <summary>
+    /// Cheap series-level layout: seeds + grouping closure with empty Mappings (plus one
+    /// synthetic main-episode mapping per movie group so its episode-id folder is listed).
+    /// Cached + single-flighted via <see cref="_cache"/>.
+    /// </summary>
+    public IReadOnlyList<SeriesData> GetSeriesStructure()
+        => (_cache is not null
+                ? _cache.GetAsync()
+                : GetSeriesStructureCoreAsync())
+            .GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Full per-series data (Mappings + Extras) for one series (or merged group), fetched
+    /// on first access and cached per series id under the same TTL semantics as before.
+    /// </summary>
+    public SeriesData? GetSeriesData(int seriesId)
+    {
+        int primary = _memberToPrimary.GetValueOrDefault(seriesId, seriesId);
+        if (IsFrozen)
+            return _seriesCache.TryGetValue(primary, out var pinned) ? pinned.Data : null;
+
+        if (_ttl > TimeSpan.Zero
+            && _seriesCache.TryGetValue(primary, out var entry)
+            && DateTime.UtcNow - entry.CachedAt < _ttl)
+            return entry.Data;
+
+        return FetchSeriesAsync(primary).GetAwaiter().GetResult();
+    }
+
+    /// <summary>Drop the warm cache for one series (or all + the structure cache when null).</summary>
+    public void Invalidate(int? seriesId)
+    {
+        if (IsFrozen)
+            return;
+        if (seriesId is null)
+        {
+            _cache?.Invalidate();
+            _seriesCache.Clear();
+            return;
+        }
+        _seriesCache.TryRemove(_memberToPrimary.GetValueOrDefault(seriesId.Value, seriesId.Value), out _);
+    }
+
+    /// <summary>Maps member series id → merged-group primary id (identity when unmapped).</summary>
+    public int ResolvePrimarySeriesId(int seriesId) => _memberToPrimary.GetValueOrDefault(seriesId, seriesId);
+
+    /// <summary>
+    /// Series ids cross-referenced by a file, from the structure pass' file listing.
+    /// Null when the file is unknown (new/unindexed — caller should fully invalidate).
+    /// </summary>
+    public IReadOnlyList<int>? GetSeriesIdsForFile(int fileId)
+        => _fileSeriesIndex.TryGetValue(fileId, out var ids) ? ids : null;
+
+    #endregion
 
     /// <summary>Forces the aggregation cache to rebuild on the next request.</summary>
-    public void Invalidate() => _cache?.Invalidate();
+    public void Invalidate() => Invalidate((int?)null);
 
     /// <summary>Pins the current cache so the FUSE mount keeps serving the last known snapshot.</summary>
     public void Freeze() => _cache?.Freeze();
@@ -95,39 +192,153 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, IDisposable
     /// <summary>Whether the cache is currently frozen (serving stale data).</summary>
     public bool IsFrozen => _cache?.IsFrozen ?? false;
 
-    /// <summary>Loads the persisted snapshot from the configured <see cref="FileSnapshotStore"/>.</summary>
-    public bool TryLoadFromStore() => _cache?.TryLoadFromStore() ?? false;
+    /// <summary>
+    /// Loads the persisted snapshot from the configured <see cref="FileSnapshotStore"/>:
+    /// entries with real (FileId&gt;0) mappings prime the per-series cache (zero refetch);
+    /// the rest prime the structure cache.
+    /// </summary>
+    public bool TryLoadFromStore()
+    {
+        if (_snapshotStore is null || _snapshotKey is null)
+            return false;
+        var loaded = _snapshotStore.TryLoad(_snapshotKey);
+        if (loaded is null)
+            return false;
 
-    /// <summary>Persists the current snapshot via the configured <see cref="FileSnapshotStore"/>.</summary>
-    public void SaveToStore() => _cache?.SaveToStore();
+        var structure = new List<SeriesData>();
+        foreach (var entry in loaded)
+        {
+            if (IsStructureEntry(entry))
+                structure.Add(entry);
+            else if (_ttl > TimeSpan.Zero)
+                _seriesCache[entry.SeriesId] = new SeriesCacheEntry(entry, DateTime.UtcNow);
+        }
+
+        _cache?.Prime(structure);
+        return true;
+    }
+
+    /// <summary>Persists structure entries plus all warm per-series entries via the snapshot store.</summary>
+    public void SaveToStore()
+    {
+        if (_snapshotStore is null || _snapshotKey is null)
+            return;
+        var snapshot = GetSnapshot();
+        if (snapshot is null)
+            return;
+        _snapshotStore.Save(_snapshotKey, snapshot);
+    }
+
+    /// <summary>
+    /// Current snapshot payload (structure + warm per-series entries) without writing to
+    /// the store. Null when the aggregation cache is unavailable (TTL disabled or the
+    /// structure pass has not run yet).
+    /// </summary>
+    public IReadOnlyList<SeriesData>? GetSnapshot()
+        => _cache?.PeekCached() is { } structure ? CombineWithWarmEntries(structure) : null;
 
     /// <summary>True when a snapshot store is configured and the last shutdown was clean.</summary>
-    public bool WasLastShutdownClean() => _cache?.WasLastShutdownClean() ?? false;
+    public bool WasLastShutdownClean()
+        => _snapshotStore is not null && _snapshotKey is not null
+           && _snapshotStore.WasLastShutdownClean(_snapshotKey);
 
     /// <summary>Discards any persisted snapshot + clean-shutdown marker.</summary>
-    public void InvalidateStored() => _cache?.InvalidateStored();
+    public void InvalidateStored()
+    {
+        if (_snapshotStore is null || _snapshotKey is null)
+            return;
+        _snapshotStore.Clear(_snapshotKey);
+    }
 
     public void Dispose() { }
 
-    private async Task<IReadOnlyList<SeriesData>> GetAllSeriesCoreAsync(CancellationToken ct = default)
+    private IReadOnlyList<SeriesData> CombineWithWarmEntries(IReadOnlyList<SeriesData> structure)
+    {
+        var warm = _seriesCache.Values
+            .Where(entry => entry.Data is not null && !IsStructureEntry(entry.Data))
+            .Select(entry => entry.Data)
+            .ToList();
+        return warm.Count == 0 ? structure : [.. structure, .. warm];
+    }
+
+    /// <summary>
+    /// Structure entries carry no real mappings: empty, or synthetic movie folder-name
+    /// placeholders (FileId 0). Anything with a FileId&gt;0 mapping is a full per-series entry.
+    /// </summary>
+    private static bool IsStructureEntry(SeriesData entry) =>
+        entry.Mappings is null || entry.Mappings.All(mapping => mapping.FileId == 0);
+
+    private async Task<SeriesData?> FetchSeriesAsync(int primaryId)
+    {
+        // Single-flight per primary id (the resolver already serializes per series; this also
+        // covers direct callers). One fetch per burst, everyone awaits the same task.
+        var tcs = new TaskCompletionSource<SeriesData?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var existing = _seriesFetches.GetOrAdd(primaryId, tcs.Task);
+        if (!ReferenceEquals(existing, tcs.Task))
+            return await existing.ConfigureAwait(false);
+
+        try
+        {
+            var data = await BuildSeriesDataAsync(primaryId).ConfigureAwait(false);
+            if (data is not null && _ttl > TimeSpan.Zero)
+                _seriesCache[primaryId] = new SeriesCacheEntry(data, DateTime.UtcNow);
+            tcs.SetResult(data);
+            return data;
+        }
+        catch (Exception ex)
+        {
+            tcs.SetException(ex);
+            throw;
+        }
+        finally
+        {
+            _seriesFetches.TryRemove(primaryId, out _);
+        }
+    }
+
+    /// <summary>
+    /// Structure pass: file seeds + series-level grouping only. No full per-series episode
+    /// fetches — just one bare (lite) episode listing per movie group for its folder name.
+    /// </summary>
+    private async Task<IReadOnlyList<SeriesData>> GetSeriesStructureCoreAsync(CancellationToken ct = default)
     {
         if (!IsEligibleManagedFolder())
             return [];
 
-        // Folder metadata for per-location eligibility checks.
-        var folders = (await _client.GetManagedFoldersAsync().ConfigureAwait(false))
-            .ToDictionary(folder => folder.ID, folder => folder);
-
         // Seed: series that have at least one file located in this managed folder.
+        // Also builds the file→series xref index used for per-file event invalidation.
         var folderFiles = await _client.GetManagedFolderFilesAsync(_managedFolderId).ConfigureAwait(false);
-        var localSeedIds = folderFiles
-            .SelectMany(file => file.SeriesIDs ?? [])
-            .Select(group => group.SeriesID.ID)
-            .Where(id => id is > 0)
-            .Select(id => id!.Value)
-            .ToHashSet();
+        var (fileSeries, localSeedIds) = BuildSeedIndex(folderFiles);
         if (localSeedIds.Count == 0)
-            return [];
+        {
+            // An empty seed set is either genuine (the folder really holds no indexed
+            // files) or a transient Shoko state (server mid-restart, import in flight,
+            // xrefs not materialized). Verify against the API before trusting it.
+            if (folderFiles.Count == 0)
+            {
+                var recheck = await _client.GetManagedFolderFilesAsync(_managedFolderId).ConfigureAwait(false);
+                if (recheck.Count > 0)
+                {
+                    folderFiles = recheck;
+                    (fileSeries, localSeedIds) = BuildSeedIndex(folderFiles);
+                }
+            }
+
+            if (localSeedIds.Count == 0)
+            {
+                int librarySeries = (await _client.GetAllSeriesAsync().ConfigureAwait(false)).Count;
+                bool verified = folderFiles.Count == 0 && librarySeries > 0;
+                string detail = folderFiles.Count == 0
+                    ? verified
+                        ? $"verified empty: two consecutive file listings returned 0 files while the library reports {librarySeries} series"
+                        : $"file listing returned 0 files and the series library reports 0 series (Shoko likely mid-restart)"
+                    : $"{folderFiles.Count} files listed but none cross-referenced to a series (xrefs not materialized?)";
+                ThrowIfTransientEmpty(0, verified, detail);
+                _fileSeriesIndex = fileSeries;
+                return [];
+            }
+        }
+        _fileSeriesIndex = fileSeries;
 
         bool enforceTmdbNumbering = _options.TmdbEpNumbering || _options.MergeTmdbSeries;
         var manualOverrides = enforceTmdbNumbering ? _options.ManualOverrideGroups : [];
@@ -148,130 +359,194 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, IDisposable
             manualOverrides
         );
 
-        // ponytail: TMDB show-episode listings are cached per GetAllSeriesAsync call, not across
-        // calls; add a persistent cache when the daemon needs one.
-        var tmdbShowEpisodeCache = new ConcurrentDictionary<int, Task<IReadOnlyList<TmdbEpisodeDto>>>();
+        // Series-level projection: same title/IsMovie semantics as the eager Project+Merge
+        // chain (isMovie = UseTmdbNumbering ? TmdbMovies.Any() : AniDB.Type == Movie), but
+        // without touching episodes or files.
+        var inputs = new List<RelaySeriesGroupingInput>();
+        foreach (var series in allSeries.Where(s => groupClosure.Contains(s.IDs.ID)))
+        {
+            var data = new SeriesData(
+                series.IDs.ID,
+                ResolveSeriesTitle(series),
+                enforceTmdbNumbering
+                    ? (series.TMDB?.Movies.Count ?? 0) > 0
+                    : series.AniDB?.Type == AnimeType.Movie,
+                Array.Empty<EpisodeData>());
+            inputs.Add(new RelaySeriesGroupingInput(
+                data,
+                series.AniDB?.ID ?? 0,
+                _options.MergeTmdbSeries ? MapAirDate(series.AniDB?.AirDate) : null,
+                _options.MergeTmdbSeries ? series.TMDB?.Shows.FirstOrDefault()?.ID : null
+            ));
+        }
 
-        // Per-series episode fetches dominate the build on large libraries (e.g. 1.4k series × ~200ms
-        // serially = 5+ minutes). Bounded concurrency cuts this by ~MaxDegreeOfParallelism.
-        var targetSeries = allSeries.Where(series => groupClosure.Contains(series.IDs.ID)).ToArray();
-        var rawSeries = new RelayRawSeries?[targetSeries.Length];
+        // Merge over structure entries (empty Mappings concatenate fine) so group
+        // consolidation — primary id, member ids — matches the eager path.
+        var groups = RelaySeriesGrouper.Group(inputs, _options.MergeTmdbSeries, manualOverrides);
+        // Guard before clobbering the group maps: a throw keeps the previous maps intact
+        // so per-series lookups keep working against the still-published snapshot.
+        ThrowIfTransientEmpty(groups.Count, verified: false, "series grouping produced no groups despite non-empty seeds");
+        _groupMembers.Clear();
+        _memberToPrimary.Clear();
+        foreach (var group in groups)
+        {
+            _groupMembers[group.PrimarySeriesId] = group.SeriesIds;
+            foreach (var id in group.SeriesIds)
+                _memberToPrimary[id] = group.PrimarySeriesId;
+        }
 
+        // Movie folder names are FormatMovieFolder(main episode id): fetch a bare episode
+        // listing per movie member and synthesize one placeholder mapping so the resolver
+        // lists the folder (and routes accesses into the lazy subtree). Extras and real
+        // files belong to the per-series pass.
+        var moviePlaceholders = new ConcurrentDictionary<int, IReadOnlyList<EpisodeData>>();
         await Parallel.ForEachAsync(
-            Enumerable.Range(0, targetSeries.Length),
-            new ParallelOptions { MaxDegreeOfParallelism = _cache.MaxDegree, CancellationToken = ct },
-            async (i, token) =>
+            groups.Where(group => group.Data.IsMovie),
+            new ParallelOptions { MaxDegreeOfParallelism = _maxDegree, CancellationToken = ct },
+            async (group, _) =>
             {
-                var series = targetSeries[i];
-                try
+                var mappings = new List<EpisodeData>();
+                foreach (var memberId in group.SeriesIds)
                 {
-                    var episodes = await _client.GetSeriesEpisodesAsync(series.IDs.ID).ConfigureAwait(false);
-                    rawSeries[i] = await ExtractSeriesAsync(series, episodes, folders, tmdbShowEpisodeCache, enforceTmdbNumbering).ConfigureAwait(false);
+                    try
+                    {
+                        var episodes = await _client.GetSeriesEpisodesLiteAsync(memberId).ConfigureAwait(false);
+                        if (PickMainEpisode(episodes) is { } main)
+                            mappings.Add(SyntheticMovieMapping(main));
+                    }
+                    catch
+                    {
+                        // ponytail: a failed lite fetch just leaves that movie folder-less in
+                        // the structure until the next rebuild; the per-series pass still works.
+                    }
                 }
-                catch
-                {
-                    // ponytail: skip one bad series rather than aborting the whole snapshot.
-                    // The slot stays null and is filtered out below.
-                }
+                if (mappings.Count > 0)
+                    moviePlaceholders[group.PrimarySeriesId] = mappings;
             }).ConfigureAwait(false);
 
-        // Drop any null slots from per-series failures; the rest still produce a valid snapshot.
-        var raw = rawSeries.Where(r => r is not null).Select(r => r!).ToList();
-        var projected = raw.Select(RelayMappingProjector.Project).ToList();
-
-        // Discover AnimeThemes Theme.mp3 (and similar non-Shoko assets) by walking the
-        // same folder file list and probing each source series folder once. Mirrors the
-        // symlink work ShokoRelay's AnimeThemesMp3Generator skips when
-        // Settings.Advanced.UseExternalVfs=true — the daemon exposes the file directly.
-        var extrasBySeries = DiscoverThemeExtras(folderFiles);
-
-        var groupingInputs = raw
-            .Zip(projected, (r, data) => new RelaySeriesGroupingInput(data, r.AnidbAnimeId, r.AirDate, r.TmdbSeriesId))
+        return groups
+            .Select(group => moviePlaceholders.TryGetValue(group.PrimarySeriesId, out var placeholders)
+                ? group.Data with { Mappings = placeholders }
+                : group.Data)
             .ToArray();
-        var merged = RelaySeriesGrouper.Merge(groupingInputs, _options.MergeTmdbSeries, manualOverrides);
-        if (extrasBySeries.Count == 0)
-            return merged;
-        return merged
-            .Select(s => extrasBySeries.TryGetValue(s.SeriesId, out var extra)
-                ? s with { Extras = new[] { extra } }
-                : s)
-            .ToList();
     }
 
     /// <summary>
-    /// Probes every distinct source-series folder in the managed folder for a Theme.mp3
-    /// file and produces a seriesId → ExtraFile map (first match wins per series). Used by
-    /// <see cref="GetAllSeriesCoreAsync"/> to surface the theme in the VFS mount.
+    /// Full per-series fetch: episodes + files for the whole merged group, projected and
+    /// merged exactly like the eager path, plus this group's Theme.mp3 extra.
     /// </summary>
-    private Dictionary<int, ExtraFile> DiscoverThemeExtras(IReadOnlyList<FileDto> folderFiles)
+    private async Task<SeriesData?> BuildSeriesDataAsync(int primaryId)
     {
-        var result = new Dictionary<int, ExtraFile>();
-        if (folderFiles.Count == 0)
-            return result;
-
-        // Cache probed absolute folders so we stat each one at most once per build.
-        var probedFolders = new HashSet<string>(StringComparer.FromComparison(_pathComparison));
-        foreach (var file in folderFiles)
-        {
-            if (file.Locations is null) continue;
-            foreach (var loc in file.Locations)
-            {
-                if (loc.ManagedFolderID != _managedFolderId) continue;
-                if (string.IsNullOrWhiteSpace(loc.RelativePath)) continue;
-
-                var sourceFolder = ResolveSourceFolder(loc.RelativePath);
-                if (sourceFolder is null || !probedFolders.Add(sourceFolder)) continue;
-
-                var themePath = Path.Combine(sourceFolder, "Theme.mp3");
-                if (!File.Exists(themePath)) continue;
-
-                long size;
-                try { size = new FileInfo(themePath).Length; }
-                catch { size = 0; }
-
-                foreach (var sr in file.SeriesIDs ?? [])
-                {
-                    int? sidNullable = sr.SeriesID.ID;
-                    if (sidNullable is not int sid || sid <= 0) continue;
-                    result.TryAdd(sid, new ExtraFile("Theme.mp3", themePath, size));
-                }
-            }
-        }
-        return result;
-    }
-
-    /// <summary>
-    /// Resolves the absolute source series folder that contains a file at the given
-    /// managed-folder-relative path. Returns null on any validation failure (empty,
-    /// rooted outside the managed folder, etc.).
-    /// </summary>
-    private string? ResolveSourceFolder(string? relativePath)
-    {
-        if (string.IsNullOrWhiteSpace(relativePath)) return null;
-        string relative = NormalizeSeparators(relativePath);
-        bool hasSingleLeadingSeparator = relative.Length > 0
-            && relative[0] == Path.DirectorySeparatorChar
-            && (relative.Length == 1 || relative[1] != Path.DirectorySeparatorChar);
-        if (relative.Length == 0
-            || (Path.IsPathRooted(relative) && !hasSingleLeadingSeparator))
-            return null;
-
-        relative = relative.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        if (relative.Length == 0) return null;
-
-        string parent = Path.GetDirectoryName(relative);
-        if (string.IsNullOrEmpty(parent)) return null;
-
         try
         {
-            string candidate = Path.GetFullPath(Path.Combine(_managedFolderRoot, parent));
-            if (!IsContained(candidate)) return null;
-            return candidate;
+            if (!IsEligibleManagedFolder())
+                return null;
+
+            var folders = (await _client.GetManagedFoldersAsync().ConfigureAwait(false))
+                .ToDictionary(folder => folder.ID, folder => folder);
+            var memberIds = _groupMembers.TryGetValue(primaryId, out var members)
+                ? members
+                : new[] { primaryId };
+
+            bool enforceTmdbNumbering = _options.TmdbEpNumbering || _options.MergeTmdbSeries;
+            // ponytail: TMDB show-episode listings are cached per per-series fetch, not across
+            // fetches; add a persistent cache when the daemon needs one.
+            var tmdbShowEpisodeCache = new ConcurrentDictionary<int, Task<IReadOnlyList<TmdbEpisodeDto>>>();
+
+            var raw = new List<RelayRawSeries>();
+            foreach (var memberId in memberIds)
+            {
+                var series = await _client.GetSeriesAsync(memberId).ConfigureAwait(false);
+                if (series is null)
+                    continue;
+                var episodes = await _client.GetSeriesEpisodesAsync(memberId).ConfigureAwait(false);
+                raw.Add(await ExtractSeriesAsync(series, episodes, folders, tmdbShowEpisodeCache, enforceTmdbNumbering).ConfigureAwait(false));
+            }
+            if (raw.Count == 0)
+                return null;
+
+            var projected = raw.Select(RelayMappingProjector.Project).ToList();
+            var groupingInputs = raw
+                .Zip(projected, (r, data) => new RelaySeriesGroupingInput(data, r.AnidbAnimeId, r.AirDate, r.TmdbSeriesId))
+                .ToArray();
+            var merged = RelaySeriesGrouper.Merge(groupingInputs, _options.MergeTmdbSeries, enforceTmdbNumbering ? _options.ManualOverrideGroups : []);
+            var result = merged.FirstOrDefault(data => data.SeriesId == primaryId) ?? merged.FirstOrDefault();
+            if (result is null)
+                return null;
+
+            // AnimeThemes Theme.mp3 next to this group's own source files (probes each
+            // mapping's source folder once). Mirrors the symlink work ShokoRelay's
+            // AnimeThemesMp3Generator skips when Settings.Advanced.UseExternalVfs=true.
+            var theme = FindThemeFile(result.Mappings);
+            return theme is null ? result : result with { Extras = [theme] };
         }
-        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException or PathTooLongException)
+        catch
         {
+            // ponytail: a failed series returns null → the resolver falls back to the
+            // structure node and refetches on the next access; never abort the mount.
             return null;
         }
+    }
+
+    /// <summary>Bare-DTO main episode: first unhidden Type==Episode, else first (unhidden) by number.</summary>
+    private static ShokoEpisodeDto? PickMainEpisode(IReadOnlyList<ShokoEpisodeDto> episodes)
+    {
+        if (episodes.Count == 0)
+            return null;
+        var visible = episodes.Where(episode => !episode.IsHidden).ToList();
+        var candidates = visible.Count > 0 ? visible : episodes;
+        return candidates.FirstOrDefault(episode => episode.AniDB?.Type == EpisodeType.Episode)
+            ?? candidates.OrderBy(EpisodeNumberOf).FirstOrDefault();
+    }
+
+    private static int EpisodeNumberOf(ShokoEpisodeDto episode) => episode.AniDB?.EpisodeNumber ?? episode.IndexNumber;
+
+    /// <summary>
+    /// Synthetic structure-only mapping for a movie series. FileId 0 marks it as a placeholder
+    /// (skipped by path validation and snapshot priming); the non-blank SourcePath only exists
+    /// so the resolver's HasSource yields the episode-id folder — any access to that path
+    /// routes into the lazily materialized subtree, so this path is never actually served.
+    /// </summary>
+    private EpisodeData SyntheticMovieMapping(ShokoEpisodeDto episode) => new(
+        0,
+        episode.IDs.ID,
+        episode.AniDB?.Type == EpisodeType.Special ? 0 : 1,
+        EpisodeNumberOf(episode),
+        null,
+        null,
+        1,
+        false,
+        true,
+        episode.Name,
+        _managedFolderRoot,
+        0,
+        "");
+
+    /// <summary>
+    /// Probes the source folders behind a series' resolved mappings for a Theme.mp3 file
+    /// (first match wins) and returns it as a series-folder extra.
+    /// </summary>
+    private ExtraFile? FindThemeFile(IReadOnlyList<EpisodeData> mappings)
+    {
+        var probedFolders = new HashSet<string>(StringComparer.FromComparison(_pathComparison));
+        foreach (var mapping in mappings)
+        {
+            if (mapping.FileId == 0 || string.IsNullOrEmpty(mapping.SourcePath))
+                continue;
+            string? sourceFolder = Path.GetDirectoryName(mapping.SourcePath);
+            if (sourceFolder is null || !probedFolders.Add(sourceFolder))
+                continue;
+
+            var themePath = Path.Combine(sourceFolder, "Theme.mp3");
+            if (!File.Exists(themePath))
+                continue;
+
+            long size;
+            try { size = new FileInfo(themePath).Length; }
+            catch { size = 0; }
+            return new ExtraFile("Theme.mp3", themePath, size);
+        }
+        return null;
     }
 
     private async Task<RelayRawSeries> ExtractSeriesAsync(
@@ -405,6 +680,58 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, IDisposable
         }
 
         return preferred;
+    }
+
+    /// <summary>
+    /// A managed folder that resolved non-empty before must not flap to empty when Shoko
+    /// transiently reports no files/series. Throwing keeps the last published snapshot
+    /// alive (the resolver's refresh loop retains it and retries after its backoff) and
+    /// the <see cref="DataSourceCache"/> keeps its previous entry, instead of publishing
+    /// an empty snapshot that empties every directory in the mount.
+    /// </summary>
+    /// <param name="count">Series/groups resolved in this pass.</param>
+    /// <param name="verified">True when the API independently confirmed the folder is
+    /// genuinely empty (two consecutive empty file listings + a non-empty library).</param>
+    /// <param name="detail">Diagnostic text included in the exception when transient.</param>
+    private void ThrowIfTransientEmpty(int count, bool verified, string detail)
+    {
+        if (count > 0)
+        {
+            Volatile.Write(ref _lastSeriesCount, count);
+            return;
+        }
+
+        if (verified)
+        {
+            Volatile.Write(ref _lastSeriesCount, 0);
+            return;
+        }
+
+        int last = Volatile.Read(ref _lastSeriesCount);
+        if (last > 0)
+            throw new InvalidOperationException(
+                $"Relay source for managed folder {_managedFolderId} transiently resolved 0 series (last known: {last}; {detail}); keeping the previous snapshot.");
+    }
+
+    private static (Dictionary<int, int[]> FileSeries, HashSet<int> SeedIds) BuildSeedIndex(IReadOnlyList<FileDto> files)
+    {
+        var fileSeries = new Dictionary<int, int[]>();
+        var seeds = new HashSet<int>();
+        foreach (var file in files)
+        {
+            var ids = (file.SeriesIDs ?? [])
+                .Select(group => group.SeriesID.ID)
+                .Where(id => id is > 0)
+                .Select(id => id!.Value)
+                .Distinct()
+                .ToArray();
+            if (ids.Length == 0)
+                continue;
+            fileSeries[file.ID] = ids;
+            foreach (var id in ids)
+                seeds.Add(id);
+        }
+        return (fileSeries, seeds);
     }
 
     private bool IsEligibleManagedFolder()
@@ -632,4 +959,6 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, IDisposable
     private sealed record ResolvedSource(string AbsolutePath, string RelativePath, string Extension);
 
     private sealed record SelectedSource(string AbsolutePath, string RelativePath, int ManagedFolderId, long Size, string Extension);
+
+    private sealed record SeriesCacheEntry(SeriesData Data, DateTime CachedAt);
 }

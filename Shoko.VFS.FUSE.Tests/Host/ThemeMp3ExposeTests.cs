@@ -42,6 +42,8 @@ public sealed class ThemeMp3ExposeTests
                 body = _folderFilesJson;
             else if (path.Contains("/api/v3/Series") && path.Contains("/Episode"))
                 body = _seriesEpisodesJson;
+            else if (System.Text.RegularExpressions.Regex.IsMatch(path, @"/api/v3/Series/\d+$"))
+                body = ExtractFirst(_allSeriesJson); // GET /api/v3/Series/{id} returns the bare entry
             else if (path.Contains("/api/v3/Series"))
                 body = query.Contains("page=1") ? _allSeriesJson : "{\"Total\":0,\"List\":[]}";
             else if (path.Contains("/api/v3/TMDB/Show/") && path.Contains("/Episode"))
@@ -56,6 +58,14 @@ public sealed class ThemeMp3ExposeTests
             {
                 Content = new StringContent(body, Encoding.UTF8, "application/json"),
             });
+        }
+
+        /// <summary>Extracts the first entry of a ListResult JSON envelope (single-series endpoint).</summary>
+        private static string ExtractFirst(string listJson)
+        {
+            int start = listJson.IndexOf("[", StringComparison.Ordinal) + 1;
+            int end = listJson.LastIndexOf("]", StringComparison.Ordinal);
+            return listJson[start..end];
         }
     }
 
@@ -102,10 +112,16 @@ public sealed class ThemeMp3ExposeTests
             };
 
             var ds = new ShokoRelayDataSource(client, options, TimeSpan.FromSeconds(30), maxDegree: 1);
-            var all = ds.GetAllSeries();
-            Assert.Single(all);
-            var s = all[0];
-            Assert.NotNull(s.Extras);
+
+            // The structure pass lists the series without any per-series data or extras.
+            var structure = ds.GetSeriesStructure();
+            Assert.Single(structure);
+            Assert.Empty(structure[0].Mappings);
+
+            // Extras live on the lazily fetched per-series data.
+            var s = ds.GetSeriesData(structure[0].SeriesId);
+            Assert.NotNull(s);
+            Assert.NotNull(s!.Extras);
             Assert.Single(s.Extras!);
             Assert.Equal("Theme.mp3", s.Extras![0].Name);
             Assert.Equal(Path.Combine(seriesFolder, "Theme.mp3"), s.Extras![0].SourcePath);

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -10,6 +11,7 @@ namespace Shoko.VFS.FUSE.Resolvers;
 public sealed class ShokoPathResolver : IVirtualPathResolver
 {
     private readonly IShokoPathDataSource? _dataSource;
+    private readonly ILazyShokoPathDataSource? _lazyDataSource;
     private readonly IVirtualTreeDataSource? _treeDataSource;
     private readonly IPathNamingStrategy? _naming;
     private readonly PathResolverOptions _options;
@@ -17,6 +19,8 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
     private readonly AutoResetEvent _refreshSignal = new(false);
     private readonly Thread _refreshWorker;
     private readonly object _publishGate = new();
+    private readonly ConcurrentDictionary<int, SeriesSubtree> _subtrees = new();
+    private readonly ConcurrentDictionary<int, SemaphoreSlim> _seriesGates = new();
     private ResolverSnapshot? _snapshot;
     private int _refreshQueued;
     private int _refreshRunning;
@@ -41,6 +45,7 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
         ILogger? logger)
     {
         _dataSource = dataSource;
+        _lazyDataSource = dataSource as ILazyShokoPathDataSource;
         _naming = naming;
         _options = options ?? new PathResolverOptions();
         _logger = logger ?? NullLogger<ShokoPathResolver>.Instance;
@@ -102,7 +107,22 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
 
     public void Invalidate(string mountRelativePath, bool includeChildren = false)
     {
+        if (_lazyDataSource is { } lazy)
+        {
+            lazy.Invalidate(null);
+            _subtrees.Clear();
+        }
         RequestRefresh(forced: true);
+    }
+
+    /// <summary>
+    /// Drops the cached subtree for one series so the next access refetches it
+    /// (lazy data sources only; no-op otherwise).
+    /// </summary>
+    public void InvalidateSeries(int seriesId)
+    {
+        _lazyDataSource?.Invalidate(seriesId);
+        _subtrees.TryRemove(seriesId, out _);
     }
 
     public void Rebuild() => RequestRefresh(forced: true);
@@ -125,7 +145,90 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
 
     private IReadOnlyList<VirtualEntry>? ResolveDirectory(ResolverSnapshot snapshot, string[] segments)
     {
+        var subtree = RouteToSeriesSubtree(snapshot, segments);
+        if (subtree is not null)
+            return subtree.ReadDirectory(segments);
+
         return snapshot.Tree.ReadDirectory(segments);
+    }
+
+    /// <summary>
+    /// Finds the longest structure-path prefix that maps to a series and returns its
+    /// materialized subtree, or null when the path is not under a mapped series root.
+    /// </summary>
+    private VirtualTreeSnapshot? RouteToSeriesSubtree(ResolverSnapshot snapshot, string[] segments)
+    {
+        if (segments.Length == 0 || snapshot.SeriesPathMap is not { } pathMap)
+            return null;
+
+        int? seriesId = null;
+        string prefix = string.Empty;
+        for (int index = 0; index < segments.Length; index++)
+        {
+            // ponytail: joined prefix walk; layouts are shallow. Index the map if paths deepen.
+            prefix = prefix.Length == 0 ? segments[index] : prefix + "/" + segments[index];
+            if (pathMap.TryGetValue(prefix, out var mapped))
+                seriesId = mapped;
+        }
+
+        return seriesId is int id ? GetSeriesSubtree(id) : null;
+    }
+
+    private VirtualTreeSnapshot? GetSeriesSubtree(int seriesId)
+    {
+        if (TryGetCachedSubtree(seriesId, out var cached))
+            return cached;
+
+        // Single-flight per seriesId so concurrent readdir/getattr don't double-fetch.
+        var gate = _seriesGates.GetOrAdd(seriesId, static _ => new SemaphoreSlim(1, 1));
+        gate.Wait();
+        try
+        {
+            if (TryGetCachedSubtree(seriesId, out cached))
+                return cached;
+
+            var stopwatch = Stopwatch.StartNew();
+            var data = _lazyDataSource!.GetSeriesData(seriesId);
+            var tree = data is null ? null : BuildSeriesTree(BuildModel(data));
+            var completedAt = DateTimeOffset.UtcNow;
+            _subtrees[seriesId] = new SeriesSubtree(tree, completedAt);
+            stopwatch.Stop();
+            _logger.LogDebug(
+                "Materialized VFS subtree for series {SeriesId} in {Elapsed}; HasData={HasData}",
+                seriesId,
+                stopwatch.Elapsed,
+                data is not null
+            );
+            return tree;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private bool TryGetCachedSubtree(int seriesId, out VirtualTreeSnapshot? tree)
+    {
+        if (_subtrees.TryGetValue(seriesId, out var entry)
+            && _options.SeriesCacheTtl > TimeSpan.Zero
+            && DateTimeOffset.UtcNow - entry.CompletedAt < _options.SeriesCacheTtl)
+        {
+            tree = entry.Tree;
+            return true;
+        }
+
+        tree = null;
+        return false;
+    }
+
+    private VirtualTreeSnapshot BuildSeriesTree(SeriesModel model)
+    {
+        var rootChildren = GetRootChildren([model]).ToArray();
+        var tvSeriesChildren = GetTvSeriesChildren([model]).ToArray();
+        var movieFolderChildren = GetMovieFolderChildren([model]).ToArray();
+        var completedAt = DateTimeOffset.UtcNow;
+        var entries = BuildLegacyEntries(rootChildren, tvSeriesChildren, movieFolderChildren, completedAt);
+        return VirtualTreeSnapshot.Build(entries, legacyFirstWins: true, completedAt);
     }
 
     private SnapshotBuildResult BuildSnapshot()
@@ -153,7 +256,12 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
             );
         }
 
-        var series = _dataSource!.GetAllSeries() ?? Array.Empty<SeriesData>();
+        // Lazy sources publish a structure-only snapshot here; per-series subtrees are
+        // materialized on first access. Empty structure mappings naturally yield no
+        // season/file entries, so only directory nodes appear in this tree.
+        var series = _lazyDataSource is { } lazySource
+            ? lazySource.GetSeriesStructure() ?? Array.Empty<SeriesData>()
+            : _dataSource!.GetAllSeries() ?? Array.Empty<SeriesData>();
         var models = new List<SeriesModel>(series.Count);
         int mappingCount = 0;
         int mappingsWithSourcePathCount = 0;
@@ -162,7 +270,7 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
             var mappings = item.Mappings ?? Array.Empty<EpisodeData>();
             mappingCount += mappings.Count;
             mappingsWithSourcePathCount += mappings.Count(mapping => !string.IsNullOrWhiteSpace(mapping.SourcePath));
-            models.Add(BuildModel(item));
+            models.Add(_lazyDataSource is null ? BuildModel(item) : BuildStructureModel(item));
         }
 
         var rootChildren = GetRootChildren(models).ToArray();
@@ -171,12 +279,16 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
         var completedAt = DateTimeOffset.UtcNow;
         var legacyEntries = BuildLegacyEntries(rootChildren, tvSeriesChildren, movieFolderChildren, completedAt);
         var treeSnapshot = VirtualTreeSnapshot.Build(legacyEntries, legacyFirstWins: true, completedAt);
+        var seriesPathMap = _lazyDataSource is null
+            ? null
+            : BuildSeriesPathMap(rootChildren, tvSeriesChildren, movieFolderChildren);
         stopwatch.Stop();
 
         return new SnapshotBuildResult(
             new ResolverSnapshot(
                 treeSnapshot,
-                completedAt
+                completedAt,
+                seriesPathMap
             ),
             stopwatch.Elapsed,
             series.Count,
@@ -458,6 +570,53 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
         }
     }
 
+    /// <summary>
+    /// Structure-pass model build. A series whose (empty) mappings produce no model
+    /// still needs its directory node listed, so synthesize a season-less Tv model.
+    /// </summary>
+    private SeriesModel BuildStructureModel(SeriesData series)
+    {
+        var model = BuildModel(series);
+        if (model.Tv is null
+            && model.Movies.Count == 0
+            && (series.Mappings?.Count ?? 0) == 0
+            && ShouldGenerateTv(series))
+        {
+            var folderName = _naming!.FormatSeriesFolder(series.SeriesId, series.DisplayTitle);
+            model = new SeriesModel(series.SeriesId, new TvModel(folderName, [], Array.Empty<FileModel>()), model.Movies);
+        }
+        return model;
+    }
+
+    private static Dictionary<string, int> BuildSeriesPathMap(
+        IReadOnlyList<RootChild> rootChildren,
+        IReadOnlyList<RootChild> tvSeriesChildren,
+        IReadOnlyList<RootChild> movieFolderChildren)
+    {
+        // Mirrors BuildLegacyEntries so mapped paths match the published tree exactly.
+        var map = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var child in rootChildren)
+        {
+            switch (child.Kind)
+            {
+                case RootChildKind.TvRoot:
+                    foreach (var series in tvSeriesChildren)
+                        map[child.Name + "/" + series.Name] = series.Series!.SeriesId;
+                    break;
+                case RootChildKind.MovieRoot:
+                    foreach (var movie in movieFolderChildren)
+                        map[child.Name + "/" + movie.Name] = movie.Series!.SeriesId;
+                    break;
+                case RootChildKind.TvSeries:
+                case RootChildKind.MovieFolder:
+                    map[child.Name] = child.Series!.SeriesId;
+                    break;
+            }
+        }
+
+        return map;
+    }
+
     private SeriesModel BuildModel(SeriesData series)
     {
         var extraFiles = (series.Extras ?? Array.Empty<ExtraFile>())
@@ -483,7 +642,7 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
 
         TvModel? tv = ShouldGenerateTv(series) ? BuildTvModel(series, mappings, coordinateCounts, versionSeeds, episodePad, extraPads, extraFiles) : null;
         var movies = ShouldGenerateMovie(series) ? BuildMovieModels(series, mappings, coordinateCounts, versionSeeds, extraPads, extraFiles) : [];
-        return new SeriesModel(tv, movies);
+        return new SeriesModel(series.SeriesId, tv, movies);
     }
 
     private TvModel? BuildTvModel(
@@ -699,11 +858,19 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
 
     private sealed record RootChild(string Name, RootChildKind Kind, SeriesModel? Series = null, MovieModel? Movie = null);
 
-    private sealed class ResolverSnapshot(VirtualTreeSnapshot tree, DateTimeOffset completedAt)
+    private sealed class ResolverSnapshot(
+        VirtualTreeSnapshot tree,
+        DateTimeOffset completedAt,
+        IReadOnlyDictionary<string, int>? seriesPathMap = null)
     {
         public VirtualTreeSnapshot Tree { get; } = tree;
         public DateTimeOffset CompletedAt { get; } = completedAt;
+
+        /// <summary>Structure path (mount-relative) to owning series id; null outside lazy mode.</summary>
+        public IReadOnlyDictionary<string, int>? SeriesPathMap { get; } = seriesPathMap;
     }
+
+    private sealed record SeriesSubtree(VirtualTreeSnapshot? Tree, DateTimeOffset CompletedAt);
 
     private sealed record SnapshotBuildResult(
         ResolverSnapshot Snapshot,
@@ -718,8 +885,9 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
         int TvChildCount,
         int MovieChildCount);
 
-    private sealed class SeriesModel(TvModel? tv, IReadOnlyList<MovieModel> movies)
+    private sealed class SeriesModel(int seriesId, TvModel? tv, IReadOnlyList<MovieModel> movies)
     {
+        public int SeriesId { get; } = seriesId;
         public TvModel? Tv { get; } = tv;
         public IReadOnlyList<MovieModel> Movies { get; } = movies;
         public string? SeriesFolderName => Tv?.SeriesFolderName;

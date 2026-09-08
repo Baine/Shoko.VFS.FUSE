@@ -17,6 +17,9 @@ public static class PathValidation
     {
         var samples = series
             .SelectMany(s => s.Mappings)
+            // Skip FileId==0 synthetic structure placeholders (movie folder-name anchors
+            // from the lazy structure pass; their SourcePath is a folder, never served).
+            .Where(m => m.FileId > 0)
             .Select(m => m.SourcePath)
             .Where(p => p is not null && !string.IsNullOrEmpty(p))
             .Take(sampleCount)

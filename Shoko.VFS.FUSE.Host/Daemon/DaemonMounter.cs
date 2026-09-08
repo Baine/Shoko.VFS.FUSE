@@ -19,25 +19,16 @@ namespace Shoko.VFS.FUSE.Host.Daemon;
 public static class DaemonMounter
 {
     /// <summary>
-    /// Creates and starts a lease for the given <c>RelayMountTarget</c>.
-    /// Returns a <c>DaemonLease</c> on success, throws <c>FuseStartException</c> on failure.
+    /// Builds the Relay path data source (REST aggregation client) for a mount target.
+    /// Shared by <see cref="StartLeaseAsync"/> and the orchestrator's warmup, which
+    /// aggregates without mounting.
     /// </summary>
-    /// <param name="target">Mount target (paths already host-mapped by the orchestrator).</param>
-    /// <param name="config">Host configuration.</param>
-    /// <param name="client">Authenticated Shoko REST client (shared by all mounts).</param>
-    /// <param name="snapshotStore">Optional persistent snapshot store (one file per mount).</param>
-    public static async Task<DaemonLease> StartLeaseAsync(
+    public static ShokoRelayDataSource CreateDataSource(
         RelayMountTarget target,
         HostConfig config,
         ShokoRestClient client,
-        ILoggerFactory loggerFactory,
-        Action? onUnexpectedStopped = null,
-        CancellationToken ct = default,
         FileSnapshotStore? snapshotStore = null)
     {
-        var logger = loggerFactory.CreateLogger("Shoko.VFS.FUSE.Host.Daemon.DaemonMounter");
-
-        // 1. Build the Relay path data source (reads data from the server via REST).
         var relayOptions = new RelayPathDataSourceOptions(target.ManagedFolderId, target.ManagedFolderPath)
         {
             ManagedFolderName = target.ManagedFolderName,
@@ -60,11 +51,35 @@ public static class DaemonMounter
             ? null
             : $"{target.ManagedFolderId}_{target.RootKind}";
 
-        var dataSource = new ShokoRelayDataSource(client, relayOptions,
+        return new ShokoRelayDataSource(client, relayOptions,
             cacheTtl: config.AggregationCacheTtl,
             maxDegree: config.AggregationFetchDegree,
             snapshotStore: snapshotStore,
             snapshotKey: snapshotKey);
+    }
+
+    /// <summary>
+    /// Creates and starts a lease for the given <c>RelayMountTarget</c>.
+    /// Returns a <c>DaemonLease</c> on success, throws <c>FuseStartException</c> on failure.
+    /// </summary>
+    /// <param name="target">Mount target (paths already host-mapped by the orchestrator).</param>
+    /// <param name="config">Host configuration.</param>
+    /// <param name="client">Authenticated Shoko REST client (shared by all mounts).</param>
+    /// <param name="snapshotStore">Optional persistent snapshot store (one file per mount).</param>
+    /// <param name="ct">Cancels between mount steps; also flows into source-path validation.</param>
+    public static async Task<DaemonLease> StartLeaseAsync(
+        RelayMountTarget target,
+        HostConfig config,
+        ShokoRestClient client,
+        ILoggerFactory loggerFactory,
+        Action? onUnexpectedStopped = null,
+        CancellationToken ct = default,
+        FileSnapshotStore? snapshotStore = null)
+    {
+        var logger = loggerFactory.CreateLogger("Shoko.VFS.FUSE.Host.Daemon.DaemonMounter");
+
+        // 1. Build the Relay path data source (reads data from the server via REST).
+        var dataSource = CreateDataSource(target, config, client, snapshotStore);
 
         // If the previous run shut down cleanly, prime the cache with the persisted
         // snapshot so the FUSE mount responds immediately while the orchestrator does

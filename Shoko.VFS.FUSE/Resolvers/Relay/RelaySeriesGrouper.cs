@@ -68,6 +68,7 @@ public static class RelaySeriesGrouper
     {
         var entries = (inputs ?? [])
             .Where(input => input.Data is not null)
+            .DistinctBy(input => input.SeriesId)
             .ToList();
         var byId = entries.ToDictionary(input => input.SeriesId);
         return GroupIds(
@@ -122,8 +123,12 @@ public static class RelaySeriesGrouper
         bool mergeTmdbSeries,
         IEnumerable<IReadOnlyList<int>>? manualOverrides)
     {
+        // ponytail: first-wins on duplicate SeriesId so one bad input can't kill a whole
+        // snapshot build; callers dedupe upstream (ShokoRestClient.GetAllSeriesAsync).
         var entries = (inputs ?? []).ToList();
-        var byId = entries.ToDictionary(input => input.SeriesId);
+        var byId = entries
+            .GroupBy(input => input.SeriesId)
+            .ToDictionary(group => group.Key, group => group.First());
         var byAnidbId = entries
             .Where(input => input.AnidbAnimeId > 0)
             .GroupBy(input => input.AnidbAnimeId)

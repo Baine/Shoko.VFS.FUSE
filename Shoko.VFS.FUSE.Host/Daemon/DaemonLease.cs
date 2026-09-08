@@ -153,6 +153,26 @@ public sealed class DaemonLease : IAsyncDisposable
     }
 
     /// <summary>
+    /// Event-scoped invalidation: drops only the subtrees/caches of the series that the
+    /// given file cross-references (per-series lazy refetch on next access). Falls back to
+    /// full invalidation when the file is not in the structure pass' xref index — e.g. a
+    /// newly hashed file whose series membership didn't exist at the last structure build.
+    /// </summary>
+    public void InvalidateFile(int fileId)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+        var seriesIds = _dataSource.GetSeriesIdsForFile(fileId);
+        if (seriesIds is null || seriesIds.Count == 0)
+        {
+            Invalidate();
+            return;
+        }
+        foreach (var seriesId in seriesIds)
+            _resolver.InvalidateSeries(_dataSource.ResolvePrimarySeriesId(seriesId));
+    }
+
+    /// <summary>
     /// Pins the underlying data source so the FUSE mount keeps serving the last known
     /// snapshot while the Shoko server is unreachable. No rebuild attempts happen while
     /// frozen; reads continue to return the cached series list.

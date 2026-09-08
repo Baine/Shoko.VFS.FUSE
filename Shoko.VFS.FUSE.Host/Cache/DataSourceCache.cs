@@ -119,6 +119,18 @@ public sealed class DataSourceCache
     public IReadOnlyList<SeriesData>? PeekCached() => _cachedData;
 
     /// <summary>
+    /// Primes the cache with externally supplied data (e.g. a structure list restored from a
+    /// persisted snapshot) without consulting the upstream fetcher. Same semantics as a fresh
+    /// build: clean, TTL restarts.
+    /// </summary>
+    public void Prime(IReadOnlyList<SeriesData> data)
+    {
+        _cachedData = data ?? throw new ArgumentNullException(nameof(data));
+        _cachedAt = DateTime.UtcNow;
+        Interlocked.Exchange(ref _dirty, 0);
+    }
+
+    /// <summary>
     /// Loads the persisted snapshot from the configured <see cref="FileSnapshotStore"/> and
     /// primes the in-memory cache. Returns true if a snapshot was loaded. Does not touch the
     /// upstream fetcher.

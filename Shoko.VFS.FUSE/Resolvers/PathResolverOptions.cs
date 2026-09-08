@@ -23,6 +23,9 @@ public sealed class PathResolverOptions
     /// <summary>Stale-while-revalidate interval for the published resolver snapshot.</summary>
     public TimeSpan CacheTtl { get; init; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>Stale interval for lazily materialized per-series subtrees (lazy data sources only).</summary>
+    public TimeSpan SeriesCacheTtl { get; init; } = TimeSpan.FromMinutes(5);
+
     /// <summary>Whether extras are linked into movie folders.</summary>
     public bool IncludeMovieExtras { get; init; } = true;
 }

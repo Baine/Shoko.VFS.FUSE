@@ -76,6 +76,22 @@ public sealed class RelaySeriesGrouperTests
         Assert.Equal(new[] { 10, 20, 30 }, closure.OrderBy(id => id));
     }
 
+    [Fact]
+    public void GroupClosureSurvivesDuplicateSeriesInputs()
+    {
+        // Regressed snapshot builds: page-shifted series listings can yield a duplicate
+        // series row; first-wins must keep grouping alive instead of throwing.
+        var metadata = new[]
+        {
+            new RelaySeriesGroupingMetadata(20, 200, new PartialDateOnly(2022, 1, 1), 900),
+            new RelaySeriesGroupingMetadata(20, 200, new PartialDateOnly(2022, 1, 1), 900),
+        };
+
+        var closure = RelaySeriesGrouper.GetGroupClosure(metadata, [20], mergeTmdbSeries: true);
+
+        Assert.Equal([20], closure);
+    }
+
     private static RelaySeriesGroupingInput Input(int id, int anidbId, PartialDateOnly airDate, int tmdbId, params EpisodeData[] mappings) =>
         new(new SeriesData(id, $"Series {id}", false, mappings), anidbId, airDate, tmdbId);
 

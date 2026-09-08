@@ -140,6 +140,9 @@ public sealed class ShokoEpisodeDto
     /// <summary>The server's preferred title (override → preferred → default).</summary>
     public string Name { get; set; } = "";
 
+    /// <summary>Bare DTO episode number (present without <c>includeDataFrom</c>).</summary>
+    public int IndexNumber { get; set; }
+
     public bool IsHidden { get; set; }
 
     public AnidbEpisodeDto? AniDB { get; set; }

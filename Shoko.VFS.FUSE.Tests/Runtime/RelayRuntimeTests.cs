@@ -40,6 +40,32 @@ public sealed class RelayRuntimeTests
     }
 
     [Fact]
+    public async Task ContentEventsWithLinkedSeriesInvalidateOnlyThoseSeries()
+    {
+        using var fixture = new RuntimeFixture(new FusePluginConfiguration { RelayEnabled = true, PlexLocalExtras = false });
+        await fixture.Runtime.StartAsync(CancellationToken.None);
+        fixture.System.CompleteStartup();
+        await Eventually(() => fixture.Starts == 1);
+
+        fixture.Video.RaiseHashed(42, 43);
+        await Eventually(() => fixture.SeriesInvalidations.Count == 2);
+        Assert.Equal(new[] { 42, 43 }, fixture.SeriesInvalidations.OrderBy(id => id).ToArray());
+        Assert.Equal(0, fixture.Invalidations);
+
+        // Events without series context fall back to the full invalidation.
+        fixture.Video.RaiseDetected();
+        await Eventually(() => fixture.Invalidations == 1);
+
+        // Hashed files without any linked series also take the full path.
+        fixture.Video.RaiseHashed();
+        await Eventually(() => fixture.Invalidations == 2);
+        Assert.Equal(2, fixture.SeriesInvalidations.Count);
+        Assert.Equal(1, fixture.Starts);
+
+        await fixture.Runtime.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task ReconcileWithUnchangedConfigurationKeepsExistingLease()
     {
         using var fixture = new RuntimeFixture(new FusePluginConfiguration { RelayEnabled = true, PlexLocalExtras = false });
@@ -469,6 +495,7 @@ public sealed class RelayRuntimeTests
         public int Stops { get; private set; }
         public int StopAttempts { get; private set; }
         public int Invalidations { get; private set; }
+        public List<int> SeriesInvalidations { get; } = [];
         public bool FailMovies { get; set; }
         public bool FailStops { get; set; }
         public bool PendingStart { get; set; }
@@ -550,6 +577,11 @@ public sealed class RelayRuntimeTests
                 {
                     PendingCleanupNotification?.TrySetResult();
                     cleanupCompleted();
+                },
+                seriesId =>
+                {
+                    lock (SeriesInvalidations)
+                        SeriesInvalidations.Add(seriesId);
                 });
             if (PendingStart)
             {
@@ -674,6 +706,19 @@ public sealed class RelayRuntimeTests
         }
 
         public void RaiseDetected() => ((VideoProxy)(object)Proxy).Detected?.Invoke(this, null!);
+        public void RaiseHashed(params int[] seriesIds)
+        {
+            var video = DispatchProxy.Create<IVideo, HashedVideoProxy>();
+            ((HashedVideoProxy)(object)video).SeriesIds = seriesIds;
+            var args = new VideoFileHashedEventArgs("/hashed.mkv", Folder, DispatchProxy.Create<IVideoFile, EmptyProxy>(), video)
+            {
+                UsedExistingHashes = false,
+                IsNewVideo = true,
+                IsNewFile = true,
+                Hashes = [],
+            };
+            Hashed?.Invoke(this, args);
+        }
         public void RaiseManagedFolderAdded(IManagedFolder folder) => ManagedFolderAdded?.Invoke(this, new ManagedFolderChangedEventArgs { Folder = folder });
         public void RaiseManagedFolderRemoved(IManagedFolder folder) => ManagedFolderRemoved?.Invoke(this, new ManagedFolderChangedEventArgs { Folder = folder });
         public void RaiseTopology() => ManagedFolderUpdated?.Invoke(this, null!);
@@ -692,6 +737,32 @@ public sealed class RelayRuntimeTests
         }
 
         private EventHandler<VideoFileDetectedEventArgs>? Detected;
+        private EventHandler<VideoFileHashedEventArgs>? Hashed;
+
+        private class HashedVideoProxy : DispatchProxy
+        {
+            internal int[] SeriesIds { get; set; } = [];
+
+            protected override object? Invoke(MethodInfo? method, object?[]? args) => method?.Name switch
+            {
+                "get_Series" => SeriesIds.Select(id =>
+                {
+                    var series = DispatchProxy.Create<Shoko.Abstractions.Metadata.Shoko.IShokoSeries, SeriesIdProxy>();
+                    ((SeriesIdProxy)(object)series).Id = id;
+                    return (Shoko.Abstractions.Metadata.Shoko.IShokoSeries)series;
+                }).ToArray(),
+                _ => Default(method?.ReturnType),
+            };
+        }
+
+        private class SeriesIdProxy : DispatchProxy
+        {
+            internal int Id { get; set; }
+
+            protected override object? Invoke(MethodInfo? method, object?[]? args) =>
+                method?.Name == "get_ID" ? Id : Default(method?.ReturnType);
+        }
+
         private class VideoProxy : DispatchProxy
         {
             internal FakeVideo Owner { get; set; } = null!;
@@ -705,6 +776,8 @@ public sealed class RelayRuntimeTests
             {
                 "add_VideoFileDetected" => Add(ref Owner.Detected, args),
                 "remove_VideoFileDetected" => Remove(ref Owner.Detected, args),
+                "add_VideoFileHashed" => Add(ref Owner.Hashed, args),
+                "remove_VideoFileHashed" => Remove(ref Owner.Hashed, args),
                 "add_ManagedFolderAdded" => Add(ref Owner.ManagedFolderAdded, args),
                 "remove_ManagedFolderAdded" => Remove(ref Owner.ManagedFolderAdded, args),
                 "add_ManagedFolderUpdated" => Add(ref Owner.ManagedFolderUpdated, args),

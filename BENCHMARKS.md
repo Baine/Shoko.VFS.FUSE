@@ -9,17 +9,20 @@
 
 For a **6,152 series / 70,498 files / 70.8 TiB** library:
 
-| Approach | First-aggregation cold start | Steady-state RAM | Disk delta | Survives Shoko restart |
+| Approach | Mount-ready cold start | Steady-state RAM | Disk delta | Survives Shoko restart |
 |---|---|---|---|---|
 | Shokofin (in-tree, virtual VFS) | ~8–20 min | ~1.5–2.5 GB (shared with Shoko) | 0 | ❌ |
 | ShokoRelay (in-tree, symlink materialization) | **2–6 hours** + cleanup scan | ~2–3 GB (shared with Shoko) | 70,498 symlinks + 37k dirs | ❌ |
-| Shoko.VFS.FUSE in-tree (virtual) | ~8–20 min | ~1.2–2.0 GB (shared with Shoko) | 0 | ❌ |
-| Shoko.VFS.FUSE.Host (REST, frozen cache) | ~15–45 min | ~600 MB–1.2 GB (separate) | snapshot JSON: ~50–500 MB | ✅ |
-| Shoko.VFS.FUSE.Host **with `--warmup`** | warmup 15–45 min offline, daemon start ~10s | same | same | ✅ |
+| Shoko.VFS.FUSE in-tree (virtual, lazy) | **~1–3 min** (structure pass) | ~1.2–2.0 GB (shared with Shoko) | 0 | ❌ |
+| Shoko.VFS.FUSE.Host (REST, lazy + frozen cache) | **~1–4 min** (structure pass) | ~600 MB–1.2 GB (separate) | snapshot JSON: ~50–500 MB | ✅ |
+| Shoko.VFS.FUSE.Host **with `--warmup`** | warmup minutes offline, daemon start ~10s | same | same | ✅ |
 
-The host daemon's `--warmup` mode is the meaningful differentiator at this
-scale: it lets you front-load the cold aggregation out-of-band so the actual
-daemon start is near-instant.
+Since the lazy-aggregation rework, the mount publishes a structure-only
+snapshot (series/movie folders) in minutes and materializes each series'
+seasons/files on first directory access (~200 ms once per series, cached —
+`SeriesCacheTtl`, default 5 min). SignalR events invalidate exactly the
+affected series instead of rebuilding everything. `--warmup` additionally
+front-loads per-series data so daemon starts stay ~10 s.
 
 ## Test environment
 
@@ -29,27 +32,32 @@ daemon start is near-instant.
 
 (Each series corresponds to a Shoko ID — includes TV, movies, OVAs, specials.)
 
-## Cold first-aggregation time
+## Cold mount-ready time (lazy architecture)
 
-| Step | Shokofin / ShokoRelay (in-process) | Shoko.VFS.FUSE in-tree | Shoko.VFS.FUSE.Host (REST) |
-|---|---|---|---|
-| `/api/v3/ManagedFolder` | n/a (in-process) | n/a | ~1 s |
-| `/api/v3/ManagedFolder/{id}/File?pageSize=0&include=XRefs` over 70,498 files | ~30 s (Shoko DB) | ~30 s (Shoko DB) | **2–10 min** ← the killer |
-| `/api/v3/Series?pageSize=100` paginated (~62 pages) | ~10 s (in-process) | ~10 s | ~30–60 s |
-| Per-series episode fetch (6,152 × ~200 ms) | serial ~21 min, **parallel@4: ~5 min**, parallel@8: ~2.5 min | same | same |
-| TMDB show episode listings (where applicable) | 1–10 min | 1–10 min | 1–10 min |
-| Projector + Grouper over 6,152 series | ~20–60 s | ~20–60 s | ~20–60 s |
-| **Total cold start** | **~8–20 min** | **~8–20 min** | **~15–45 min** |
+The eager per-series aggregation step is gone. Mount-ready = the structure
+pass only; per-series data materializes on first directory access.
 
-The host daemon is ~2× slower cold because the `/ManagedFolder/{id}/File?include=XRefs`
-endpoint is the worst offender — a single REST call that has to serialize
-70,498 entries with their cross-references. **For libraries this size,
-bump `RequestTimeout` to 15+ minutes**; the 10-minute default is the floor.
+| Step | Shoko.VFS.FUSE in-tree | Shoko.VFS.FUSE.Host (REST) |
+|---|---|---|
+| Seeds: `/ManagedFolder/{id}/File` (paginated, parallel pages) | in-process place query | ~30 s–2 min (payload-bound; XRefs kept for seed IDs) |
+| Series list `/api/v3/Series?pageSize=100` (~62 pages) | ~10 s | ~30–60 s |
+| Closure + projector + grouper (structure-level, no episodes) | ~20–60 s | ~20–60 s |
+| Movie-folder anchors (lite episode call per movie series, no `includeDataFrom`) | n/a (in-process) | tens of seconds to a few minutes for movie-heavy libraries |
+| **Mount ready** | **~1–2 min** | **~1–4 min** |
+| Per-series materialization (lazy, on first access) | one in-process load per series | one REST call ~200 ms per series, parallel by client access pattern |
 
-The default `AggregationFetchDegree: 4` controls the per-series parallelism —
-the wall time for the per-series step on a 6,152-series library goes from
-~21 min (serial) to ~5 min at degree 4, or ~2.5 min at degree 8. The
-trade-off is concurrent REST load on ShokoServer.
+Notes:
+- The former dominant cost (per-series full episode fetch × 5–6k series at
+  startup) now happens lazily per series directory and is cached
+  (`SeriesCacheTtl`, default 5 min; plugin config `SeriesCacheTtlMinutes`).
+- The `/ManagedFolder/{id}/File?include=XRefs` call remains the largest
+  single cost on the host daemon — Shoko offers no cheaper folder-scoped
+  seed query (verified against server source); pagination caps per-request
+  transfer and allows parallel page fetches. **Keep `RequestTimeout` at
+  10+ minutes** for the first page on very large folders.
+- SignalR `file:*` / `series:info.updated` events invalidate exactly the
+  affected series; only `file:detected` (pre-xref), reconnects, and huge
+  bursts fall back to a full structure rebuild.
 
 ## Steady-state RAM
 
