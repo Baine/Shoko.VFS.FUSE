@@ -90,15 +90,6 @@ public sealed class SeriesIdsDto
     public int ID { get; set; }
 
     public int AniDB { get; set; }
-
-    public TmdbSeriesIdListDto TMDB { get; set; } = new();
-}
-
-public sealed class TmdbSeriesIdListDto
-{
-    public List<int> Show { get; set; } = [];
-
-    public List<int> Movie { get; set; } = [];
 }
 
 public sealed class TmdbSeriesDataDto
