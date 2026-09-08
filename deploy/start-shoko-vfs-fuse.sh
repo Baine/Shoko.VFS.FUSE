@@ -298,6 +298,14 @@ start_daemon() {
     fi
 
     log "Started (PID $pid)."
+
+    # Mounts appear shortly after startup; keep them exported over NFS.
+    # knfsd cannot cross into FUSE submounts, so each fuse.shoko-vfs mount
+    # needs its own export entry (see install-nfs-exports.sh).
+    nfs_helper="$(dirname "$0")/install-nfs-exports.sh"
+    if [ -x "$nfs_helper" ]; then
+        ( sleep 5; "$nfs_helper" >> "$LOGDIR/daemon.log" 2>&1 ) &
+    fi
 }
 
 foreground_daemon() {
