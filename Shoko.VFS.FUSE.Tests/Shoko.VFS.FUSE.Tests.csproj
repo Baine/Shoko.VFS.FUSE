@@ -21,7 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\ShokoServer\Shoko.Abstractions\Shoko.Abstractions.csproj" />
+    <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.84" />
     <ProjectReference Include="..\Shoko.VFS.FUSE\Shoko.VFS.FUSE.csproj" />
     <ProjectReference Include="..\Shoko.VFS.FUSE.Host\Shoko.VFS.FUSE.Host.csproj" />
   </ItemGroup>

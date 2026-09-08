@@ -74,13 +74,18 @@ directory).
 5. The host daemon mounts the FUSE filesystems in the same paths the plugin
    used, so Plex/Jellyfin keep working without reconfiguration.
 
-## Why doesn't the daemon use a project reference for `Shoko.Abstractions`?
+## Why doesn't the daemon use a NuGet reference for `Shoko.Abstractions`?
 
-It does — `..\..\ShokoServer\Shoko.Abstractions\Shoko.Abstractions.csproj`. This
-requires the [ShokoServer](https://github.com/ShokoAnime/ShokoServer) source
-checkout to be at `../ShokoServer/` relative to this repo. Once a
-NuGet-package release of `Shoko.Abstractions` is available, the reference
-will move to that.
+It does. A prerelease NuGet of `Shoko.Abstractions` is published on
+[nuget.org](https://www.nuget.org/packages/Shoko.Abstractions/) (currently
+`6.0.0-alpha.84`), and all three projects reference that package instead of a
+source checkout — no sibling `ShokoServer` clone is required to build this
+repo.
+
+The plugin pins `ExcludeAssets="runtime"`: it compiles against the package but
+never ships the DLL, since Shoko Server itself provides
+`Shoko.Abstractions.dll` at runtime. Keep the package version in sync with the
+Shoko Server version you deploy against.
 
 ## How do I run only the host daemon's self-test?
 

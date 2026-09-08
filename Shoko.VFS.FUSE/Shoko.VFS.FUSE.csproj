@@ -15,10 +15,10 @@
 
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <ProjectReference Include="..\..\ShokoServer\Shoko.Abstractions\Shoko.Abstractions.csproj">
-      <Private>false</Private>
+    <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.84">
+      <ExcludeAssets>runtime</ExcludeAssets>
       <PrivateAssets>all</PrivateAssets>
-    </ProjectReference>
+    </PackageReference>
   </ItemGroup>
 
   <ItemGroup>

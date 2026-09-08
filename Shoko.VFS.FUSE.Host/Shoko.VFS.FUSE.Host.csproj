@@ -18,8 +18,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.84" />
     <ProjectReference Include="..\Shoko.VFS.FUSE\Shoko.VFS.FUSE.csproj" />
-    <ProjectReference Include="..\..\ShokoServer\Shoko.Abstractions\Shoko.Abstractions.csproj" />
   </ItemGroup>
 
 </Project>
