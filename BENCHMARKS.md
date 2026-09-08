@@ -1,9 +1,12 @@
 # Performance: Shoko.VFS.FUSE vs Shokofin vs ShokoRelay
 
-> Architectural estimates, not benchmarks. Numbers below are derived from the
-> codebase's own reference points (e.g. `ShokoRelayDataSource.cs:133` —
-> "1.4k series × ~200ms serially = 5+ minutes") and Shoko's own REST latency
-> for typical managed folders. Always validate against your own workload.
+> Host-daemon numbers below are **measured** on the production Unraid host
+> (see [Measured data](#measured-data-production-unraid-host-2026-09-08)),
+> pulled from `/mnt/cache/appdata/shoko-vfs-fuse/logs/daemon.log` and the
+> running processes. Shokofin/ShokoRelay comparison numbers remain
+> architectural estimates derived from the codebase's own reference points
+> (e.g. `ShokoRelayDataSource.cs:133` — "1.4k series × ~200ms serially =
+> 5+ minutes"). Always validate against your own workload.
 
 ## TL;DR
 
@@ -11,18 +14,50 @@ For a **6,152 series / 70,498 files / 70.8 TiB** library:
 
 | Approach | Mount-ready cold start | Steady-state RAM | Disk delta | Survives Shoko restart |
 |---|---|---|---|---|
-| Shokofin (in-tree, virtual VFS) | ~8–20 min | ~1.5–2.5 GB (shared with Shoko) | 0 | ❌ |
-| ShokoRelay (in-tree, symlink materialization) | **2–6 hours** + cleanup scan | ~2–3 GB (shared with Shoko) | 70,498 symlinks + 37k dirs | ❌ |
-| Shoko.VFS.FUSE in-tree (virtual, lazy) | **~1–3 min** (structure pass) | ~1.2–2.0 GB (shared with Shoko) | 0 | ❌ |
-| Shoko.VFS.FUSE.Host (REST, lazy + frozen cache) | **~1–4 min** (structure pass) | ~600 MB–1.2 GB (separate) | snapshot JSON: ~50–500 MB | ✅ |
-| Shoko.VFS.FUSE.Host **with `--warmup`** | warmup minutes offline, daemon start ~10s | same | same | ✅ |
+| Shokofin (in-tree, virtual VFS) | ~8–20 min * | ~1.5–2.5 GB (shared with Shoko) * | 0 | ❌ |
+| ShokoRelay (in-tree, symlink materialization) | **2–6 hours** + cleanup scan * | ~2–3 GB (shared with Shoko) * | 70,498 symlinks + 37k dirs | ❌ |
+| Shoko.VFS.FUSE in-tree (virtual, lazy) | **~1–3 min** (structure pass) * | ~1.2–2.0 GB (shared with Shoko) * | 0 | ❌ |
+| Shoko.VFS.FUSE.Host (REST, lazy + frozen cache) | ~3 s warm / **~40 min** cold reconcile (16 mounts, background) ✅ measured | **~490 MB** (separate) ✅ measured | snapshot JSON: **~1.6 MB** total ✅ measured | ✅ |
+| Shoko.VFS.FUSE.Host **with `--warmup`** | warmup minutes offline, daemon start **~3 s** ✅ measured | same | same | ✅ |
+
+\* = estimate, not measured. All ✅ measured rows come from the production
+Unraid host (16 managed folders, 32 FUSE mounts, see below).
 
 Since the lazy-aggregation rework, the mount publishes a structure-only
 snapshot (series/movie folders) in minutes and materializes each series'
 seasons/files on first directory access (~200 ms once per series, cached —
 `SeriesCacheTtl`, default 5 min). SignalR events invalidate exactly the
 affected series instead of rebuilding everything. `--warmup` additionally
-front-loads per-series data so daemon starts stay ~10 s.
+front-loads per-series data so daemon starts stay fast (measured ~3 s).
+
+## Measured data (production Unraid host, 2026-09-08)
+
+Source: `/mnt/cache/appdata/shoko-vfs-fuse/logs/daemon.log` (one-day window),
+`ps`, and `/mnt/cache/appdata/shoko-vfs-fuse/cache/`. 16 managed folders
+(Anime Shows/Movies ×4 + Hentai Shows/Movies ×4), each with Tv + Movie mounts
+= **32 live FUSE mounts**, served stale-while-revalidate.
+
+| Metric | Measured |
+|---|---|
+| Warm daemon start (cached snapshots) | health endpoint up → **all 16 mounts serving in ~1–3 s** (18:02:28 → 18:02:29; 02:02:12 → 02:02:15) |
+| Per-mount snapshot load from disk | 1–220 ms (largest: 976-series mount, 0.22 s) |
+| Background reconcile after warm start | **~40 min** for all 16 mounts (18:02:29 unfreeze → 18:42:15 last fresh snapshot published; seeding dominates, resolver builds run staggered/overlapped) |
+| Per-mount resolver build (cold, after seeding) | ~2:08–3:00 for the big mounts (976–1,419 series); max observed 9:27 |
+| Series per mount (Tv snapshots) | 976, 1,419, 684, 499, 174, 167, 902, 681, 324, 136, 28 … (library-wide distinct count ≈ 6.1k as before) |
+| Snapshot cache on disk | **1.6 MB total** — 32 JSON files, largest ~180 KB |
+| Host daemon RSS | **~487 MB** (during active Plex transcode through the mount) |
+| Shoko server (Shoko.CLI) RSS | ~8 GB, for comparison |
+| Errors in 24 h of log | 2 (one transient snapshot-build `ArgumentException`, recovered on next build) |
+
+Notes:
+- The doc's previous "snapshot JSON: ~50–500 MB" estimate was wrong by ~2–3
+  orders of magnitude: structure-only snapshots (series/movie folders, no
+  per-file payload) are tiny.
+- "Mount ready ~1–4 min" was likewise optimistic for a 16-mount deployment:
+  that figure is per-mount; full-fleet reconcile is ~40 min, but the frozen
+  cache means the *mounts serve data within seconds* the whole time.
+- Warm restarts happen cleanly in practice: two clean restarts in the log
+  window, both ~1–3 s to fully serving, `.clean_shutdown` markers present.
 
 ## Test environment
 
@@ -43,7 +78,7 @@ pass only; per-series data materializes on first directory access.
 | Series list `/api/v3/Series?pageSize=100` (~62 pages) | ~10 s | ~30–60 s |
 | Closure + projector + grouper (structure-level, no episodes) | ~20–60 s | ~20–60 s |
 | Movie-folder anchors (lite episode call per movie series, no `includeDataFrom`) | n/a (in-process) | tens of seconds to a few minutes for movie-heavy libraries |
-| **Mount ready** | **~1–2 min** | **~1–4 min** |
+| **Mount ready** | **~1–2 min** | per-mount ~2–9 min; full fleet (16 mounts) ~40 min, background ✅ measured |
 | Per-series materialization (lazy, on first access) | one in-process load per series | one REST call ~200 ms per series, parallel by client access pattern |
 
 Notes:
@@ -66,7 +101,7 @@ Notes:
 | Shokofin | Shoko + Shokofin module | ~1.5–2.5 GB (inherits all of Shoko's caches) |
 | ShokoRelay | Shoko + ShokoRelay plugin | ~2–3 GB (Shoko + symlink tracking + cleanup index) |
 | Shoko.VFS.FUSE in-tree | Shoko + plugin | ~1.2–2.0 GB |
-| Shoko.VFS.FUSE.Host | Standalone | ~600 MB–1.2 GB (separate process; + per-mount snapshot files on disk) |
+| Shoko.VFS.FUSE.Host | Standalone | **~490 MB measured** (separate process; + ~1.6 MB snapshot files on disk for 32 mounts) |
 
 ## Disk usage
 
@@ -75,7 +110,7 @@ Notes:
 | Shokofin | 0 | 0 | 0 |
 | ShokoRelay | **70,498 symlinks** (~5–10 MB metadata) + ~37,000 directories | 0 | inode-heavy |
 | Shoko.VFS.FUSE in-tree | 0 | 0 | 0 |
-| Shoko.VFS.FUSE.Host | 0 | **~50–500 MB JSON** (one per mount) | trivial |
+| Shoko.VFS.FUSE.Host | 0 | **~1.6 MB JSON measured** (32 files, largest ~180 KB — structure-only, no per-file payload) | trivial |
 
 ## Where the wins actually land
 
@@ -120,8 +155,10 @@ Notes:
   (REST round-trip). After the resolver snapshot is warm, subsequent reads
   go through a hot path. Plex/Jellyfin typically cache metadata so this is
   a one-time cost per scan.
-- **First aggregation pain:** 15–45 min cold start on this library vs 8–20
-  min for Shokofin. Mitigated by `--warmup` (below).
+- **First aggregation pain:** ~40 min full-fleet reconcile on this deployment
+  (16 managed folders, measured) vs 8–20 min for Shokofin. Mitigated twice
+  over: the frozen cache serves within seconds, and `--warmup` moves the
+  reconcile offline (below).
 - **Memory:** host daemon is its own process. 1 GB dedicated is non-trivial
   on a 16 GB host. In-tree Shoko.VFS.FUSE shares Shoko's heap so it's cheaper
   on memory at the cost of sharing Shoko's restart fate.
@@ -164,12 +201,12 @@ them for the real daemon to handle).
 
 ### Updated cost numbers with `--warmup`
 
-For a 6,152-series library:
+For a 6,152-series library (measured on the Unraid host, 16 mounts):
 
 | Path | Without `--warmup` | With `--warmup` |
 |---|---|---|
-| First daemon start (cold) | 15–45 min (FUSE serves empty cache while reconcile runs in background) | 15–45 min (during warmup, FUSE briefly mounts) |
-| Subsequent daemon start | 15–45 min (same cold path; no snapshot to load) | **~10 s** (load JSON, mark dirty, serve stale-while-revalidate) |
+| First daemon start (cold) | ~40 min reconcile (FUSE serves empty/stale cache while reconcile runs in background; measured) | ~40 min (during warmup, FUSE briefly mounts) |
+| Subsequent daemon start | ~40 min (same cold path; no snapshot to load) | **~3 s measured** (load JSON, mark dirty, serve stale-while-revalidate) |
 | FUSE first-read latency during initial reconcile | empty cache → slow first fetch per directory, ~50–200 ms per REST round-trip | served from loaded snapshot immediately, <1 ms |
 | Total cold-aggregation work | once at first daemon start | once at warmup, *before* the daemon exists |
 | Daemon process resource use during cold aggregation | full RSS for the duration | full RSS during warmup, then idle for the daemon |
@@ -230,8 +267,8 @@ scanning" window.
 - You have ≥ 4 GB free RAM for a dedicated process.
 - Your primary pain was the 404 storm during Shoko outages (which is what
   triggered this branch of work).
-- The library is large enough that the 15–45 min cold aggregation matters
-  to your Plex-scan workflow.
+- The library is large enough that the ~40 min cold reconcile matters
+  to your Plex-scan workflow (measured: 16 managed folders).
 
 **Always run `--warmup` once** before enabling the host daemon for the
 first time on a library this size, and consider a daily / weekly timer
