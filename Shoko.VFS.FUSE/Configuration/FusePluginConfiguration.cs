@@ -22,7 +22,9 @@ public sealed class FusePluginConfiguration : IConfiguration, IConfigurationWith
 
     /// <summary>
     /// Movie generation mode. Matches relay's MovieGenerationMode.
-    /// 0 = Disabled, 1 = EnabledMaintain, 2 = EnabledRemove.
+    /// 0 = Disabled (single TV root with shows and movies, no movie root),
+    /// 1 = EnabledMaintain (movie root with movies only, movies also kept in the TV root),
+    /// 2 = EnabledRemove (movie root with movies only, movies removed from the TV root).
     /// </summary>
     public MovieGenerationMode MovieGenerationMode { get; set; } = MovieGenerationMode.Disabled;
 

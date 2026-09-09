@@ -29,6 +29,27 @@ the filesystem instead. ShokoRelay's other features (metadata, Plex, AnimeThemes
 Theme.mp3 generation) continue to work; the daemon consumes the `Theme.mp3`
 files ShokoRelay writes into the source folders and exposes them in the VFS.
 
+## How does `MovieGenerationMode` affect what appears in each VFS root?
+
+It mirrors ShokoRelay's own semantics exactly (see ShokoRelay's
+`MovieGenerationMode` enum in `Config/RelayConfig.cs`):
+
+| Value | `!ShokoRelayVFS` (TV root) | `!ShokoRelayMovieVFS` (movie root) |
+|---|---|---|
+| `0` — Disabled | Shows **and** movies (movies as TV-shaped paths) | not created |
+| `1` — EnabledMaintain | Shows **and** movies (movies as TV-shaped paths) | movies only |
+| `2` — EnabledRemove | Shows only | movies only |
+
+Mode 1 keeps a duplicate TV-shaped view of every movie in the TV root **by
+design** — upstream ShokoRelay documents it as "Generate standalone movie
+folders but keep them in the standard VFS as well". If you want movies to
+appear only in the movie root (no mixing), use mode `2`.
+
+Consequently, a movie entry is not "misclassified" when it appears in the TV
+root under mode `1`; that is the Maintain behavior. Movie-root folders are
+named by the series' main Shoko episode ID (e.g. `10769/Movie [18625].mkv`),
+not by the series ID.
+
 ## Why are my logs full of 404s / connection errors?
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#repeated-404--taskcanceledexception-in-the-logs).
