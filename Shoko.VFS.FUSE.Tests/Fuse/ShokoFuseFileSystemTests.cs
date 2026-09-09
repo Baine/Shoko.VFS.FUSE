@@ -48,7 +48,7 @@ public class ShokoFuseFileSystemTests
             LastModified = new DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero)
         };
 
-        var stat = ShokoFuseFileSystem.BuildStat(entry);
+        var stat = ShokoFuseFileSystem.BuildStat(entry, 0, 0);
 
         Assert.Equal(1_000_000, stat.st_size);
         Assert.Equal(1, stat.st_nlink);
@@ -66,7 +66,7 @@ public class ShokoFuseFileSystemTests
             Mode = VirtualEntry.DefaultMode(VirtualNodeType.Directory)
         };
 
-        var stat = ShokoFuseFileSystem.BuildStat(entry);
+        var stat = ShokoFuseFileSystem.BuildStat(entry, 0, 0);
 
         Assert.Equal(2, stat.st_nlink);
         Assert.Equal(0, stat.st_size);
@@ -84,7 +84,7 @@ public class ShokoFuseFileSystemTests
             SymlinkTarget = "/some/target"
         };
 
-        var stat = ShokoFuseFileSystem.BuildStat(entry);
+        var stat = ShokoFuseFileSystem.BuildStat(entry, 0, 0);
 
         Assert.Equal(VirtualEntry.DefaultMode(VirtualNodeType.Symlink), (uint)stat.st_mode);
     }

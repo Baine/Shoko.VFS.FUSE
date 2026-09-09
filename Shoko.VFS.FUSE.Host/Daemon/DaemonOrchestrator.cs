@@ -353,8 +353,9 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
     }
 
     /// <summary>
-    /// Reads /proc/self/mountinfo and returns mountpoints containing our VFS root folder names
-    /// as path segments (i.e., managed folder children like /mnt/.../!ShokoRelayVFS).
+    /// Reads /proc/self/mountinfo and returns our FUSE mounts, identified by filesystem
+    /// type <c>fuse.shoko-vfs</c>. Falls back to mounts whose mountpoint ends in one of
+    /// our VFS root folder names (covers mounts made by versions that used another type name).
     /// </summary>
     internal static List<string> GetStaleMountPoints()
     {
@@ -367,19 +368,19 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
 
         foreach (var raw in File.ReadLines("/proc/self/mountinfo"))
         {
-            // Format: ... mountpoint ... - fstype ...
-            // Split on whitespace; mountpoint is field index 4.
+            // Format: ... mountpoint ... - fstype source ...
             var fields = raw.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (fields.Length < 6)
+            var separator = Array.IndexOf(fields, "-");
+            if (fields.Length < 6 || separator < 6)
                 continue;
 
             var mountPoint = fields[4];
+            var fsType = fields[separator + 1];
             var segments = mountPoint.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            if (segments.Length > 0 && (segments[^1].Equals(tvName, StringComparison.Ordinal)
-                                     || segments[^1].Equals(movieName, StringComparison.Ordinal)))
-            {
+            var nameMatch = segments.Length > 0 && (segments[^1].Equals(tvName, StringComparison.Ordinal)
+                                                    || segments[^1].Equals(movieName, StringComparison.Ordinal));
+            if (fsType == "fuse.shoko-vfs" || nameMatch)
                 result.Add(mountPoint);
-            }
         }
 
         return result;

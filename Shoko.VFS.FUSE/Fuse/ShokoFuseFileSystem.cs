@@ -46,12 +46,24 @@ public sealed class ShokoFuseFileSystem : IFuseOperations
     private readonly IVirtualPathResolver _resolver;
     private readonly ILogger _logger;
     private readonly int _maxReadSize;
+    private readonly uint _uid;
+    private readonly uint _gid;
 
-    public ShokoFuseFileSystem(IVirtualPathResolver resolver, ILogger logger, int maxReadSize = 128 * 1024)
+    /// <param name="uid">Owner UID reported by getattr; null = daemon process UID.</param>
+    /// <param name="gid">Owner GID reported by getattr; null = daemon process GID.</param>
+    /// <remarks>
+    /// The kernel's user_id/group_id mount options are set by fusermount3 to the
+    /// mounting user and libfuse3 does not honor uid=/gid= as attribute overrides,
+    /// so file ownership must be reported here.
+    /// </remarks>
+    public ShokoFuseFileSystem(IVirtualPathResolver resolver, ILogger logger, int maxReadSize = 128 * 1024,
+        uint? uid = null, uint? gid = null)
     {
         _resolver = resolver;
         _logger = logger;
         _maxReadSize = maxReadSize;
+        _uid = uid ?? NativeUserInfo.Uid;
+        _gid = gid ?? NativeUserInfo.Gid;
     }
 
     public void Init(ref FuseConnInfo fuse_conn_info)
@@ -71,10 +83,10 @@ public sealed class ShokoFuseFileSystem : IFuseOperations
         return Encoding.UTF8.GetString(bytes[..len]);
     }
 
-    internal static FuseFileStat BuildStat(VirtualEntry entry)
+    internal static FuseFileStat BuildStat(VirtualEntry entry, uint uid, uint gid)
     {
         var stat = new FuseFileStat();
-        FillStat(ref stat, entry);
+        FillStat(ref stat, entry, uid, gid);
         return stat;
     }
 
@@ -215,13 +227,18 @@ public sealed class ShokoFuseFileSystem : IFuseOperations
     }
     public PosixResult IoCtl(ReadOnlyNativeMemory<byte> fileNamePtr, int cmd, IntPtr arg, ref FuseFileInfo fileInfo, FuseIoctlFlags flags, IntPtr data) => PosixResult.ENOSYS;
 
-    private static void FillStat(ref FuseFileStat stat, VirtualEntry entry)
+    private void FillStat(ref FuseFileStat stat, VirtualEntry entry)
+    {
+        FillStat(ref stat, entry, _uid, _gid);
+    }
+
+    private static void FillStat(ref FuseFileStat stat, VirtualEntry entry, uint uid, uint gid)
     {
         stat.st_mode = (PosixFileMode)(entry.Mode != 0 ? entry.Mode : VirtualEntry.DefaultMode(entry.NodeType));
         stat.st_size = entry.Size;
         stat.st_nlink = entry.IsDirectory ? 2 : 1;
-        stat.st_uid = NativeUserInfo.Uid;
-        stat.st_gid = NativeUserInfo.Gid;
+        stat.st_uid = uid;
+        stat.st_gid = gid;
         var ts = new TimeSpec(entry.LastModified);
         stat.st_atim = ts;
         stat.st_ctim = ts;

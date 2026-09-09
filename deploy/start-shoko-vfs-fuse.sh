@@ -185,18 +185,16 @@ read_pid() {
     fi
 }
 
+list_daemon_pids() {
+    # Live daemon PIDs: from the PID file plus any process whose command
+    # line matches the binary (catches rogue/untracked instances). Deduped.
+    for pid in $( { read_pid; pgrep -f -- "$BIN" 2>/dev/null; } | sort -u); do
+        kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+    done
+}
+
 is_running() {
-    pid="$(read_pid)"
-
-    [ -n "$pid" ] || return 1
-
-    case "$pid" in
-        *[!0-9]*)
-            return 1
-            ;;
-    esac
-
-    kill -0 "$pid" 2>/dev/null
+    [ -n "$(list_daemon_pids)" ]
 }
 
 remove_stale_pidfile() {
@@ -206,24 +204,28 @@ remove_stale_pidfile() {
 }
 
 stop_daemon() {
-    remove_stale_pidfile
+    pids="$(list_daemon_pids)"
 
-    if ! is_running; then
+    if [ -z "$pids" ]; then
+        rm -f "$PIDFILE"
         log "Shoko VFS FUSE is not running."
         return 0
     fi
 
-    pid="$(read_pid)"
-    log "Stopping Shoko VFS FUSE (PID $pid)..."
+    log "Stopping Shoko VFS FUSE (PID $(echo $pids | tr '\n' ' '))..."
 
-    kill "$pid" 2>/dev/null || true
+    for pid in $pids; do
+        kill "$pid" 2>/dev/null || true
+    done
 
     i=0
-    while kill -0 "$pid" 2>/dev/null; do
+    while [ -n "$(list_daemon_pids)" ]; do
         i=$((i + 1))
         if [ "$i" -ge 10 ]; then
             log "Daemon did not stop cleanly; sending SIGKILL."
-            kill -9 "$pid" 2>/dev/null || true
+            for pid in $(list_daemon_pids); do
+                kill -9 "$pid" 2>/dev/null || true
+            done
             break
         fi
         sleep 1
@@ -241,11 +243,9 @@ export_connection_env() {
 }
 
 start_daemon() {
-    remove_stale_pidfile
-
     if is_running; then
-        pid="$(read_pid)"
-        log "Shoko VFS FUSE is already running (PID $pid)."
+        pids="$(list_daemon_pids)"
+        log "Shoko VFS FUSE is already running (PID $(echo $pids | tr '\n' ' '))."
         return 0
     fi
 
@@ -334,17 +334,22 @@ warmup_daemon() {
 }
 
 status_daemon() {
-    remove_stale_pidfile
+    pids="$(list_daemon_pids)"
 
-    if is_running; then
-        pid="$(read_pid)"
-        log "Shoko VFS FUSE is running (PID $pid)."
+    if [ -n "$pids" ]; then
+        tracked_pid="$(read_pid)"
+        log "Shoko VFS FUSE is running (PID $(echo $pids | tr '\n' ' '))."
+        case " $pids " in
+            *" $tracked_pid "*) ;;
+            *) log "WARNING: running instance(s) not tracked by PID file $PIDFILE." ;;
+        esac
         log "Binary: $BIN"
         [ ! -f "$CONFIG" ] || log "Config: $CONFIG"
         log "Log:    $LOGDIR/daemon.log"
         return 0
     fi
 
+    rm -f "$PIDFILE"
     log "Shoko VFS FUSE is not running."
     return 1
 }

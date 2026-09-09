@@ -281,7 +281,7 @@ public sealed class FuseMountService : IDisposable
                 $"FUSE mount {Name} refused: fusermount3 not found.");
 
         // 5. Start FUSE daemon (NO stale unmount — auto_unmount handles crash recovery)
-        _fs = new ShokoFuseFileSystem(_resolver, _logger, _options.MaxReadSize);
+        _fs = new ShokoFuseFileSystem(_resolver, _logger, _options.MaxReadSize, _options.Uid, _options.Gid);
         _sourceToken = $"Shoko.VFS.FUSE:{Convert.ToHexString(RandomNumberGenerator.GetBytes(16))}";
         var args = BuildArgs(_sourceToken);
         _fuse = new FuseService(_fs, args);
