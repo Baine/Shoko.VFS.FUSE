@@ -95,6 +95,10 @@ public sealed class ShokoRestClient
     public Task<ManagedFolderDto?> GetManagedFolderAsync(int managedFolderId)
         => GetJsonOrNullAsync<ManagedFolderDto>($"api/v3/ManagedFolder/{managedFolderId}");
 
+    /// <summary><c>GET /api/v3/Plugin</c> — installed plugins (ID is the plugin GUID).</summary>
+    public Task<IReadOnlyList<ShokoPluginDto>> GetPluginsAsync()
+        => GetJsonAsync<IReadOnlyList<ShokoPluginDto>>("api/v3/Plugin");
+
 /// <summary>
 /// <c>GET /api/v3/ManagedFolder/{id}/File?pageSize=10000&amp;page={n}&amp;include=XRefs</c> —
 /// every file in the managed folder, with per-series cross-reference groups. Fetched in

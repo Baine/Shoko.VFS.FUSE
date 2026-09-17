@@ -46,7 +46,7 @@ public sealed class VirtualTreeResolverTests
         {
             Ready(resolver);
 
-            Assert.Equal(new[] { "7", "8", "800" }, Names(resolver.ReadDirectory("")));
+            Assert.Equal(new[] { "7", "8", "800", ".ignore" }, Names(resolver.ReadDirectory("")));
             Assert.Equal(new[] { "Trailers", "Season 1" }, Names(resolver.ReadDirectory("7")));
             Assert.Equal(
                 new[] { "S01E01-dup1 [701].mkv", "S01E01-dup2 [702].mkv", "S01E02-pt1.mkv", "S01E02-pt2.mkv" },

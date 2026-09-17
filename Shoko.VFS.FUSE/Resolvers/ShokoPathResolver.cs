@@ -278,6 +278,17 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
         var movieFolderChildren = GetMovieFolderChildren(models).ToArray();
         var completedAt = DateTimeOffset.UtcNow;
         var legacyEntries = BuildLegacyEntries(rootChildren, tvSeriesChildren, movieFolderChildren, completedAt);
+        // Upstream writes a 0-byte `.ignore` into every VFS root so Shoko does not import
+        // the generated tree (VfsBuilder EnsureDirectory/CleanVfsRoot); mirror it as a
+        // virtual root file for side-by-side parity (the plugin additionally suppresses
+        // imports via RelayIgnoreRule).
+        if (string.Equals(_naming!.Consumer, "relay", StringComparison.OrdinalIgnoreCase))
+            legacyEntries.Add(new VirtualTreeEntryData(
+                ".ignore",
+                VirtualNodeType.File,
+                SourcePath: "",
+                Mode: VirtualEntry.DefaultMode(VirtualNodeType.File),
+                LastModified: completedAt));
         var treeSnapshot = VirtualTreeSnapshot.Build(legacyEntries, legacyFirstWins: true, completedAt);
         var seriesPathMap = _lazyDataSource is null
             ? null
@@ -619,7 +630,9 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
 
     private SeriesModel BuildModel(SeriesData series)
     {
-        var extraFiles = (series.Extras ?? Array.Empty<ExtraFile>())
+        // Series-root broadcast files (AnimeThemes Shorts; upstream mirrors them into the
+        // TV root and every movie root alike).
+        var broadcastFiles = (series.Extras ?? Array.Empty<ExtraFile>())
             .Select(e => new FileModel(e.Name, e.SourcePath, e.Size))
             .ToList();
         var mappings = series.Mappings ?? Array.Empty<EpisodeData>();
@@ -640,8 +653,8 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
             .Where(group => group.Value > 1)
             .ToDictionary(group => group.Key, _ => 1);
 
-        TvModel? tv = ShouldGenerateTv(series) ? BuildTvModel(series, mappings, coordinateCounts, versionSeeds, episodePad, extraPads, extraFiles) : null;
-        var movies = ShouldGenerateMovie(series) ? BuildMovieModels(series, mappings, coordinateCounts, versionSeeds, extraPads, extraFiles) : [];
+        TvModel? tv = ShouldGenerateTv(series) ? BuildTvModel(series, mappings, coordinateCounts, versionSeeds, episodePad, extraPads, broadcastFiles) : null;
+        var movies = ShouldGenerateMovie(series) ? BuildMovieModels(series, mappings, coordinateCounts, versionSeeds, extraPads, broadcastFiles) : [];
         return new SeriesModel(series.SeriesId, tv, movies);
     }
 
@@ -652,10 +665,16 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
         IReadOnlyDictionary<(int Season, int Episode, bool IsVariation), int> versionSeeds,
         int episodePad,
         IReadOnlyDictionary<int, int> extraPads,
-        IReadOnlyList<FileModel> extraFiles)
+        IReadOnlyList<FileModel> broadcastFiles)
     {
         var versionCounters = versionSeeds.ToDictionary(pair => pair.Key, pair => pair.Value);
         var seasons = new Dictionary<string, (int Season, List<FileModel> Files)>(StringComparer.Ordinal);
+        // TV series-root files: broadcasts first, then per-mapping series assets aggregated in
+        // upstream's mapping order (later source folders replace earlier ones, mirroring
+        // TryCreateLink's delete-and-recreate), plus the TV-only Plex local extras.
+        var rootFiles = new List<FileModel>(broadcastFiles);
+        foreach (var extra in series.TvLocalExtras ?? Array.Empty<ExtraFile>())
+            MergeFile(rootFiles, new FileModel(extra.Name, extra.SourcePath, extra.Size));
 
         foreach (var mapping in mappings.OrderBy(mapping => mapping.Season).ThenBy(mapping => mapping.Episode).ThenBy(mapping => mapping.PartIndex ?? 0))
         {
@@ -706,6 +725,10 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
                 seasons.Add(seasonName, season);
             }
             AddFile(season.Files, fileName, mapping.SourcePath!, mapping.Size);
+            AppendLocalAssets(season.Files, fileName, mapping, tvRender: true);
+            if (!mapping.SuppressTvLocalAssets)
+                foreach (var asset in mapping.SeriesAssets ?? Array.Empty<ExtraFile>())
+                    MergeFile(rootFiles, new FileModel(asset.Name, asset.SourcePath, asset.Size));
         }
 
         return seasons.Count == 0
@@ -716,7 +739,7 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
                     .OrderBy(season => season.Season)
                     .Select(season => new SeasonModel(season.Season, _naming!.FormatSeasonFolder(season.Season), season.Files.ToArray()))
                     .ToArray(),
-                extraFiles
+                rootFiles
             );
     }
 
@@ -726,10 +749,10 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
         IReadOnlyDictionary<(int Season, int Episode, bool IsVariation), int> coordinateCounts,
         IReadOnlyDictionary<(int Season, int Episode, bool IsVariation), int> versionSeeds,
         IReadOnlyDictionary<int, int> extraPads,
-        IReadOnlyList<FileModel> extraFiles)
+        IReadOnlyList<FileModel> broadcastFiles)
     {
         var versionCounters = versionSeeds.ToDictionary(pair => pair.Key, pair => pair.Value);
-        var movies = new Dictionary<string, List<FileModel>>(StringComparer.Ordinal);
+        var movies = new Dictionary<string, (List<FileModel> Files, List<FileModel> RootFiles)>(StringComparer.Ordinal);
 
         foreach (var mapping in mappings.Where(mapping => mapping.IsMain))
         {
@@ -758,10 +781,15 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
 
             if (!movies.TryGetValue(folderName, out var movie))
             {
-                movie = [];
+                movie = ([], new List<FileModel>(broadcastFiles));
                 movies.Add(folderName, movie);
             }
-            AddFile(movie, fileName, mapping.SourcePath!, mapping.Size);
+            AddFile(movie.Files, fileName, mapping.SourcePath!, mapping.Size);
+            // Upstream movie pass: sidecars/attachments are linked without the TV crossover
+            // gate, and only main mappings contribute series-level assets to the movie folder.
+            AppendLocalAssets(movie.Files, fileName, mapping, tvRender: false);
+            foreach (var asset in mapping.SeriesAssets ?? Array.Empty<ExtraFile>())
+                MergeFile(movie.RootFiles, new FileModel(asset.Name, asset.SourcePath, asset.Size));
         }
 
         if (_options.IncludeMovieExtras && movies.Count > 0)
@@ -799,16 +827,20 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
                 .OrderBy(movie => movie.Key, StringComparer.Ordinal)
                 .Select(movie => new MovieModel(
                     movie.Key,
-                    movie.Value.ToArray(),
+                    movie.Value.Files.ToArray(),
                     extras.Select(extra => new ExtraDirectoryModel(extra.Key, extra.Value.ToArray())).ToArray(),
-                    extraFiles
+                    movie.Value.RootFiles.ToArray()
                 ))
                 .ToArray();
         }
 
         return movies
             .OrderBy(movie => movie.Key, StringComparer.Ordinal)
-            .Select(movie => new MovieModel(movie.Key, movie.Value.ToArray(), Array.Empty<ExtraDirectoryModel>(), extraFiles))
+            .Select(movie => new MovieModel(
+                movie.Key,
+                movie.Value.Files.ToArray(),
+                Array.Empty<ExtraDirectoryModel>(),
+                movie.Value.RootFiles.ToArray()))
             .ToArray();
     }
 
@@ -846,6 +878,47 @@ public sealed class ShokoPathResolver : IVirtualPathResolver
         if (files.Any(file => string.Equals(file.Name, name, StringComparison.Ordinal)))
             return;
         files.Add(new FileModel(name, sourcePath, Math.Max(0, size)));
+    }
+
+    /// <summary>
+    /// Replaces an existing entry with the same name or appends — mirrors upstream
+    /// TryCreateLink's delete-and-recreate, where a later source folder's asset wins.
+    /// </summary>
+    private static void MergeFile(List<FileModel> files, FileModel file)
+    {
+        for (int index = 0; index < files.Count; index++)
+        {
+            if (string.Equals(files[index].Name, file.Name, StringComparison.Ordinal))
+            {
+                files[index] = file;
+                return;
+            }
+        }
+        files.Add(file);
+    }
+
+    /// <summary>
+    /// Links a mapping's discovered local assets next to its video entry (upstream
+    /// VfsAssetLinker.LinkEpisodeMetadata / LinkAttachmentFolder / LinkLocalExtras-inline):
+    /// every asset name is the entry's VFS base name plus the source-derived suffix, so
+    /// sidecars always pair with the video under the same naming strategy. Inline Plex
+    /// extras are TV-only (upstream LinkLocalExtras runs inside the TV pass).
+    /// </summary>
+    private static void AppendLocalAssets(List<FileModel> files, string videoFileName, EpisodeData mapping, bool tvRender)
+    {
+        var sidecars = tvRender && mapping.SuppressTvLocalAssets ? null : mapping.Sidecars;
+        var inlineExtras = tvRender ? mapping.InlineLocalExtras : null;
+        if (sidecars is not { Count: > 0 } && inlineExtras is not { Count: > 0 })
+            return;
+
+        // Upstream derives the sidecar base from the linked video's destination filename.
+        // ponytail: inline extras use this same entry base; upstream rebuilds it from raw
+        // mapping fields, which only differs for dup/variation peer-gated names.
+        string destBase = Path.GetFileNameWithoutExtension(videoFileName);
+        foreach (var sidecar in sidecars ?? [])
+            AddFile(files, destBase + sidecar.Suffix, sidecar.SourcePath, sidecar.Size);
+        foreach (var inline in inlineExtras ?? [])
+            AddFile(files, destBase + inline.Suffix, inline.SourcePath, inline.Size);
     }
 
     private enum RootChildKind

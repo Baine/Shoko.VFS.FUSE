@@ -131,7 +131,9 @@ public sealed class RelayNamingStrategy : IPathNamingStrategy
         return name + extension;
     }
 
-    private static string CleanEpisodeTitleForFilename(string? title)
+    // internal: reused by RelayLocalAssetLinker for subtitle-replacement validation and
+    // AnimeThemes theme filename construction (upstream calls the same VfsHelper helpers).
+    internal static string CleanEpisodeTitleForFilename(string? title)
     {
         if (string.IsNullOrWhiteSpace(title))
             return "";
@@ -153,7 +155,7 @@ public sealed class RelayNamingStrategy : IPathNamingStrategy
         return s_whitespaceRegex.Replace(cleaned, " ").Trim(' ');
     }
 
-    private static string SanitizeName(string name)
+    internal static string SanitizeName(string name)
     {
         if (string.IsNullOrWhiteSpace(name))
             return "Unknown";

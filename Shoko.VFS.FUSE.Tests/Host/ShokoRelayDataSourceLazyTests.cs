@@ -33,6 +33,14 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
         File.WriteAllText(Path.Combine(_root, "Show", "ep1.mkv"), "x");
         File.WriteAllText(Path.Combine(_root, "Show", "Theme.mp3"), "theme");
         File.WriteAllText(Path.Combine(_root, "Film", "movie.mkv"), "y");
+        // The host mirrors upstream ResolveSourcePath: only files that exist on disk are
+        // eligible, so every fixture location must be a real file.
+        File.WriteAllText(Path.Combine(_root, "Film", "special.mkv"), "s");
+        File.WriteAllText(Path.Combine(_root, "Film", "movie2.mkv"), "m2");
+        File.WriteAllText(Path.Combine(_root, "Film", "movie_merged.mkv"), "mm");
+        File.WriteAllText(Path.Combine(_root, "Film", "movie2-trailer.mkv"), "mt");
+        Directory.CreateDirectory(Path.Combine(_root, "!AnimeThemes"));
+        File.WriteAllText(Path.Combine(_root, "!AnimeThemes", "movie_themes.mkv"), "th");
     }
 
     public void Dispose()
@@ -83,6 +91,165 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
     }
 
     [Fact]
+    public void StructurePass_MergedMultiPartMovieFile_AnchorsOnlyFirstEpisode()
+    {
+        var handler = CreateFixtureCore(out var client, addSpecial: true, mergedMovieFile: true);
+        var ds = CreateDataSource(client);
+
+        var structure = ds.GetSeriesStructure();
+
+        var movie = Assert.Single(structure, s => s.SeriesId == MovieSeriesId);
+        Assert.True(movie.IsMovie);
+        // A single file xref'd to main episode 21 (#1) and part episode 25 (#2) anchors
+        // only its first covered episode, matching upstream's per-mapping mainEpIds rule.
+        var placeholder = Assert.Single(movie.Mappings);
+        Assert.Equal(21, placeholder.EpisodeId);
+        Assert.Equal(0, placeholder.FileId);
+    }
+
+    [Fact]
+    public void StructurePass_HiddenFirstCoveredEpisode_IsNotAnchored()
+    {
+        // F5: the merged file xrefs hidden episode 20 (first) and visible 21 — upstream
+        // filters hidden episodes out of mapping inputs, so the visible one anchors.
+        CreateFixtureCore(out var client, addSpecial: true, mergedMovieFile: true, hiddenFirst: true);
+        var ds = CreateDataSource(client);
+
+        var structure = ds.GetSeriesStructure();
+
+        var movie = Assert.Single(structure, s => s.SeriesId == MovieSeriesId);
+        Assert.Equal(new[] { 21 }, movie.Mappings.Select(m => m.EpisodeId).ToArray());
+    }
+
+    [Fact]
+    public void StructurePass_XrefOrderAgainstCoordinates_AnchorsEarliestCrossReferencedEpisode()
+    {
+        // Full-xref-priority parity: the merged file xrefs part episode 25 (#2) BEFORE
+        // main episode 21 (#1). Upstream's DeduplicateByCoords moves the first
+        // cross-reference to the front unconditionally, so 25 becomes the mapping
+        // primary and gets the folder — a coordinate sort would have anchored 21 instead.
+        CreateFixtureCore(out var client, addSpecial: true, mergedMovieFile: true, xrefFirst: true);
+        var ds = CreateDataSource(client);
+
+        var structure = ds.GetSeriesStructure();
+
+        var movie = Assert.Single(structure, s => s.SeriesId == MovieSeriesId);
+        Assert.Equal(new[] { 21, 25 }, movie.Mappings.Select(m => m.EpisodeId).Order().ToArray());
+    }
+
+    [Fact]
+    public void StructurePass_MergedFileUnderIgnoredFeatureRoot_IsNotEligible()
+    {
+        // F7: upstream's ignore set includes the !AnimeThemes root; a merged file that
+        // only lives there must not anchor its part episode.
+        CreateFixtureCore(out var client, addSpecial: true, mergedMovieFile: true, mergedLocation: "!AnimeThemes/movie_themes.mkv");
+        var ds = CreateDataSource(client);
+
+        var structure = ds.GetSeriesStructure();
+
+        var movie = Assert.Single(structure, s => s.SeriesId == MovieSeriesId);
+        Assert.Equal(new[] { 21 }, movie.Mappings.Select(m => m.EpisodeId).ToArray());
+    }
+
+    [Fact]
+    public void StructurePass_InlineLocalExtraFile_IsNotEligible()
+    {
+        // F8: "movie2 -trailer.mkv" beside "movie2.mkv" is a Plex inline extra — upstream
+        // IsPathIgnored drops it, so episode 22 keeps its "no sourced file" shape... but
+        // here episode 21's real file still anchors its own folder.
+        CreateFixtureCore(out var client, addSpecial: true, inlineExtraSecondMain: true);
+        var ds = CreateDataSource(client);
+
+        var structure = ds.GetSeriesStructure();
+
+        var movie = Assert.Single(structure, s => s.SeriesId == MovieSeriesId);
+        Assert.Equal(new[] { 21 }, movie.Mappings.Select(m => m.EpisodeId).ToArray());
+    }
+
+    [Fact]
+    public void StructurePass_FilesMissingOnDisk_DropSeriesNodesEntirely()
+    {
+        // F3 + F2: with the group's only sources deleted, upstream neither links nor
+        // lists the series folder — the structure pass must drop the mapping-less shell.
+        CreateFixture(out var client);
+        File.Delete(Path.Combine(_root, "Show", "ep1.mkv"));
+        File.Delete(Path.Combine(_root, "Film", "movie.mkv"));
+        File.Delete(Path.Combine(_root, "Film", "special.mkv"));
+        var ds = CreateDataSource(client);
+
+        var structure = ds.GetSeriesStructure();
+
+        Assert.Empty(structure);
+    }
+
+    [Fact]
+    public void PerSeriesData_ExcludedLocationVideoStillCountsTowardPartIndices()
+    {
+        // F10: upstream keeps location-excluded videos in the mapping inputs (they count
+        // toward the part split) and skips them only at link time.
+        var nvfsDir = Path.Combine(_root, "Show", "NoVFS");
+        Directory.CreateDirectory(nvfsDir);
+        File.WriteAllText(Path.Combine(_root, "Show", "ep cd1.mkv"), "a");
+        File.WriteAllText(Path.Combine(nvfsDir, "ep cd2.mkv"), "b");
+
+        var fileA = new FileDto
+        {
+            ID = 40,
+            Size = 1,
+            Locations = [new FileLocationDto { ManagedFolderID = ManagedFolderId, RelativePath = "Show/ep cd1.mkv" }],
+            SeriesIDs = [new FileCrossRefGroupDto
+            {
+                SeriesID = new FileSeriesIdsDto { ID = TvSeriesId },
+                EpisodeIDs = [new FileEpisodeIdsDto { ID = 1 }],
+            }],
+        };
+        var fileB = new FileDto
+        {
+            ID = 41,
+            Size = 1,
+            Locations = [new FileLocationDto { ManagedFolderID = ManagedFolderId, RelativePath = "Show/NoVFS/ep cd2.mkv" }],
+            SeriesIDs = [new FileCrossRefGroupDto
+            {
+                SeriesID = new FileSeriesIdsDto { ID = TvSeriesId },
+                EpisodeIDs = [new FileEpisodeIdsDto { ID = 1 }],
+            }],
+        };
+        var episode = Episode(1, TvSeriesId, 1007, EpisodeType.Episode, fileA);
+        episode.Files = [fileA, fileB];
+        var tvSeries = new ShokoSeriesDto
+        {
+            IDs = new SeriesIdsDto { ID = TvSeriesId },
+            Name = "Show",
+            AniDB = new AnidbAnimeDto { ID = 1007, Type = AnimeType.TV },
+        };
+        var handler = new FakeShokoHandler(
+            folders: [new ManagedFolderDto { ID = ManagedFolderId, Name = "Import", Path = _root, DropFolderType = DropFolderType.Both }],
+            files: [fileA, fileB],
+            series: [tvSeries],
+            fullEpisodes: new() { [TvSeriesId] = [episode] },
+            aniDbEpisodes: new() { [TvSeriesId] = [episode] });
+        var http = new HttpClient(handler) { BaseAddress = new Uri("http://test/") };
+        var client = new ShokoRestClient(http, "http://test/");
+        var ds = new ShokoRelayDataSource(client, new RelayPathDataSourceOptions(ManagedFolderId, _root)
+        {
+            ManagedFolderName = "Import",
+            ManagedFolderType = Shoko.Abstractions.Video.Enums.DropFolderType.Destination,
+            FolderExclusions = "NoVFS",
+        }, cacheTtl: TimeSpan.FromMinutes(5), maxDegree: 2);
+
+        var data = ds.GetSeriesData(TvSeriesId);
+
+        Assert.NotNull(data);
+        var kept = Assert.Single(data!.Mappings, m => !string.IsNullOrEmpty(m.SourcePath));
+        Assert.Equal(40, kept.FileId);
+        Assert.Equal(1, kept.PartIndex);
+        Assert.Equal(2, kept.PartCount);
+        var excluded = Assert.Single(data.Mappings, m => string.IsNullOrEmpty(m.SourcePath));
+        Assert.Equal(41, excluded.FileId);
+        Assert.Equal(2, excluded.PartIndex);
+    }
+
+    [Fact]
     public void PerSeriesData_FetchedLazily_Cached_AndInvalidatedById()
     {
         var handler = CreateFixture(out var client);
@@ -114,9 +281,38 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
         var movie = ds.GetSeriesData(MovieSeriesId);
         Assert.NotNull(movie);
         Assert.Equal(4, handler.FullEpisodeFetches);
-        var theme = ds.GetSeriesData(TvSeriesId)!.Extras!.Single();
+        var theme = Assert.Single(ds.GetSeriesData(TvSeriesId)!.Mappings.SelectMany(mapping => mapping.SeriesAssets ?? []));
         Assert.Equal("Theme.mp3", theme.Name);
         Assert.Equal(Path.Combine(_root, "Show", "Theme.mp3"), theme.SourcePath);
+    }
+
+    [Fact]
+    public void PerSeriesData_DiscoversLocalAssetsNextToSourceFiles()
+    {
+        // Local assets next to the indexed episode: sidecar, series artwork, inline extra.
+        File.WriteAllText(Path.Combine(_root, "Show", "ep1.en.srt"), "sub");
+        File.WriteAllBytes(Path.Combine(_root, "Show", "poster.jpg"), new byte[2]);
+        File.WriteAllText(Path.Combine(_root, "Show", "ep1-trailer.mkv"), "trailer");
+        var handler = CreateFixture(out var client);
+        var ds = CreateDataSource(client);
+        ds.GetSeriesStructure();
+
+        var data = ds.GetSeriesData(TvSeriesId);
+
+        Assert.NotNull(data);
+        var mapping = Assert.Single(data!.Mappings);
+        Assert.Equal(
+            Path.Combine(_root, "Show", "ep1.en.srt"),
+            Assert.Single(mapping.Sidecars ?? [], sidecar => sidecar.Suffix == ".en.srt").SourcePath);
+        Assert.Equal(
+            Path.Combine(_root, "Show", "poster.jpg"),
+            Assert.Single(mapping.SeriesAssets ?? [], asset => asset.Name == "poster.jpg").SourcePath);
+        // Inline Plex extras are excluded from mapping eligibility (F8/F10) but resurface as
+        // inline-local-extra entries beside the parent video (LinkLocalExtras TV pass).
+        Assert.Equal(
+            Path.Combine(_root, "Show", "ep1-trailer.mkv"),
+            Assert.Single(mapping.InlineLocalExtras ?? [], inline => inline.Suffix == "-trailer.mkv").SourcePath);
+        Assert.Equal(1, handler.FullEpisodeFetches);
     }
 
     [Fact]
@@ -176,7 +372,15 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
         return handler;
     }
 
-    private FakeShokoHandler CreateFixtureCore(out ShokoRestClient client, bool addSpecial, bool secondMain = false)
+    private FakeShokoHandler CreateFixtureCore(
+        out ShokoRestClient client,
+        bool addSpecial,
+        bool secondMain = false,
+        bool mergedMovieFile = false,
+        string mergedLocation = "Film/movie_merged.mkv",
+        bool hiddenFirst = false,
+        bool xrefFirst = false,
+        bool inlineExtraSecondMain = false)
     {
         var tvFile = new FileDto
         {
@@ -215,19 +419,52 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
                 }],
             });
         }
-        if (secondMain)
+        if (secondMain || inlineExtraSecondMain)
         {
+            // Episode 22 backed by its own file → its own folder (each file anchors its
+            // own primary). The inline-extra variant sits next to "movie2.mkv" with a Plex
+            // extra suffix, which upstream IsPathIgnore drops as a source.
             files.Add(new FileDto
             {
                 ID = 16,
                 Size = 1,
-                Locations = [new FileLocationDto { ManagedFolderID = ManagedFolderId, RelativePath = "Film/movie2.mkv" }],
+                Locations = [new FileLocationDto
+                {
+                    ManagedFolderID = ManagedFolderId,
+                    RelativePath = inlineExtraSecondMain ? "Film/movie2-trailer.mkv" : "Film/movie2.mkv",
+                }],
                 SeriesIDs = [new FileCrossRefGroupDto
                 {
                     SeriesID = new FileSeriesIdsDto { ID = MovieSeriesId },
                     EpisodeIDs = [new FileEpisodeIdsDto { ID = 22 }],
                 }],
             });
+        }
+        FileDto? mergedFile = null;
+        if (mergedMovieFile)
+        {
+            // One merged file covering the main episode (21, #1) AND a part episode:
+            // upstream creates a single folder anchored on the mapping primary. hiddenFirst
+            // adds a hidden lower-id episode as covered id (must not anchor); xrefFirst
+            // lists the part episode (#2) BEFORE the main (#1) in the xref order,
+            // discriminating xref priority from coordinate order.
+            var covered = hiddenFirst
+                ? new[] { 21, 20 }
+                : xrefFirst
+                    ? new[] { 25, 21 }
+                    : new[] { 21, 25 };
+            mergedFile = new FileDto
+            {
+                ID = 18,
+                Size = 1,
+                Locations = [new FileLocationDto { ManagedFolderID = ManagedFolderId, RelativePath = mergedLocation }],
+                SeriesIDs = [new FileCrossRefGroupDto
+                {
+                    SeriesID = new FileSeriesIdsDto { ID = MovieSeriesId },
+                    EpisodeIDs = [.. covered.Select(id => new FileEpisodeIdsDto { ID = id })],
+                }],
+            };
+            files.Add(mergedFile);
         }
 
         var tvSeries = new ShokoSeriesDto
@@ -251,10 +488,14 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
         var movieEpisodes = new List<ShokoEpisodeDto>
         {
             Episode(21, MovieSeriesId, 1009, EpisodeType.Episode, movieFile),
-            Episode(22, MovieSeriesId, 1009, EpisodeType.Episode, secondMain ? files[3] : null),
+            Episode(22, MovieSeriesId, 1009, EpisodeType.Episode, secondMain || inlineExtraSecondMain ? files[3] : null),
         };
         if (addSpecial)
             movieEpisodes.Add(Episode(24, MovieSeriesId, 1009, EpisodeType.Special, files[2]));
+        if (hiddenFirst)
+            movieEpisodes.Add(Episode(20, MovieSeriesId, 1009, EpisodeType.Episode, mergedFile, hidden: true));
+        if (mergedMovieFile)
+            movieEpisodes.Add(Episode(25, MovieSeriesId, 1009, EpisodeType.Episode, mergedFile, episodeNumber: 2));
 
         var handler = new FakeShokoHandler(
             folders: [new ManagedFolderDto { ID = ManagedFolderId, Name = "Import", Path = _root, DropFolderType = DropFolderType.Both }],
@@ -275,12 +516,12 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
         return handler;
     }
 
-    private static ShokoEpisodeDto Episode(int episodeId, int seriesId, int anidbAnimeId, EpisodeType type, FileDto? file) => new()
+    private static ShokoEpisodeDto Episode(int episodeId, int seriesId, int anidbAnimeId, EpisodeType type, FileDto? file, int episodeNumber = 1, bool hidden = false) => new()
     {
         IDs = new EpisodeIdsDto { ID = episodeId, ParentSeries = seriesId },
         Name = $"Episode {episodeId}",
-        IsHidden = false,
-        AniDB = new AnidbEpisodeDto { ID = episodeId, AnimeID = anidbAnimeId, Type = type, EpisodeNumber = 1 },
+        IsHidden = hidden,
+        AniDB = new AnidbEpisodeDto { ID = episodeId, AnimeID = anidbAnimeId, Type = type, EpisodeNumber = episodeNumber },
         Files = file is null ? [] : [file],
     };
 

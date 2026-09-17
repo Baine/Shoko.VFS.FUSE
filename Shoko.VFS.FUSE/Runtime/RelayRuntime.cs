@@ -68,9 +68,33 @@ public sealed class RelayRuntime : BackgroundService
             metadataService,
             configurationProvider,
             applicationPaths,
-            RelayMountOperationsFactory.Create(metadataService, loggerFactory, videoService),
+            RelayMountOperationsFactory.Create(
+                metadataService,
+                loggerFactory,
+                videoService,
+                ResolveAnimeThemesXrefCsvPath(applicationPaths)),
             logger)
     {
+    }
+
+    /// <summary>
+    /// Best-effort discovery of ShokoRelay's AniDB→AnimeThemes xref CSV (its plugin config
+    /// dir under the standard Shoko configurations path). Upstream registers generated
+    /// <c>Shorts/*.webm</c> from this file (VfsBuilder.cs:704-733); when it is absent (feature
+    /// never ran, or a legacy install layout) Shorts exposure is simply skipped.
+    /// </summary>
+    private static string ResolveAnimeThemesXrefCsvPath(IApplicationPaths applicationPaths)
+    {
+        const string relayPluginId = "2b0f5a7e-3d2b-4f3d-9e6b-7f0a6b2d8c9a";
+        try
+        {
+            string candidate = Path.Combine(applicationPaths.ConfigurationsPath, relayPluginId, "anidb_animethemes_xrefs.csv");
+            return File.Exists(candidate) ? candidate : "";
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
+        {
+            return "";
+        }
     }
 
     internal RelayRuntime(

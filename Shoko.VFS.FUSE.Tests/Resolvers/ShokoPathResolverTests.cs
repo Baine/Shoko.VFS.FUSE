@@ -17,7 +17,7 @@ public class ShokoPathResolverTests
         var resolver = new ShokoPathResolver(source, new RelayNamingStrategy());
         resolver = Ready(resolver);
 
-        Assert.Equal(new[] { "12" }, Names(resolver.ReadDirectory("/")));
+        Assert.Equal(new[] { "12", ".ignore" }, Names(resolver.ReadDirectory("/")));
         Assert.Empty(resolver.ReadDirectory(@"\!ShokoRelayVFS\"));
         Assert.Equal(new[] { "Season 1" }, Names(resolver.ReadDirectory("12")));
 
@@ -44,7 +44,7 @@ public class ShokoPathResolverTests
         );
         resolver = Ready(resolver);
 
-        Assert.Equal(new[] { "1" }, Names(resolver.ReadDirectory("")));
+        Assert.Equal(new[] { "1", ".ignore" }, Names(resolver.ReadDirectory("")));
         Assert.Equal(new[] { "Season 1" }, Names(resolver.ReadDirectory("1")));
         Assert.Empty(resolver.ReadDirectory(RelayMovieRoot));
     }
@@ -71,9 +71,9 @@ public class ShokoPathResolverTests
 
         var expectedChildren = mode switch
         {
-            MovieGenerationMode.EnabledMaintain => new[] { "2", "500" },
-            MovieGenerationMode.EnabledRemove => new[] { "500" },
-            _ => new[] { "2" },
+            MovieGenerationMode.EnabledMaintain => new[] { "2", "500", ".ignore" },
+            MovieGenerationMode.EnabledRemove => new[] { "500", ".ignore" },
+            _ => new[] { "2", ".ignore" },
         };
         Assert.Equal(expectedChildren, Names(resolver.ReadDirectory("/")));
         Assert.Equal(expectedTv ? new[] { "Season 1" } : Array.Empty<string>(), Names(resolver.ReadDirectory("2")));
@@ -193,7 +193,8 @@ public class ShokoPathResolverTests
         );
         resolver = Ready(resolver);
 
-        Assert.Empty(resolver.ReadDirectory(""));
+        // The relay root always carries the upstream `.ignore` marker file.
+        Assert.Equal(new[] { ".ignore" }, Names(resolver.ReadDirectory("")));
         Assert.Empty(resolver.ReadDirectory("601"));
     }
 
@@ -205,7 +206,8 @@ public class ShokoPathResolverTests
         var resolver = new ShokoPathResolver(source, new RelayNamingStrategy());
         resolver = Ready(resolver);
 
-        Assert.Empty(resolver.ReadDirectory(""));
+        // The relay root always carries the upstream `.ignore` marker file.
+        Assert.Equal(new[] { ".ignore" }, Names(resolver.ReadDirectory("")));
         Assert.Empty(resolver.ReadDirectory("7/Season 1"));
         Assert.Null(resolver.Lookup("7/Season 1/S01E01 [701].mkv"));
         Assert.Null(resolver.GetSourcePath("7/Season 1/S01E01 [701].mkv"));

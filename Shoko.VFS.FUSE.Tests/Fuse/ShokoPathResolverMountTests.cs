@@ -97,6 +97,12 @@ public sealed class ShokoPathResolverMountTests : IAsyncLifetime
             var roots = Directory.GetDirectories(_mountPoint).Select(Path.GetFileName).OrderBy(name => name, StringComparer.Ordinal).ToArray();
             Assert.Equal(new[] { "111", "222" }, roots);
 
+            // Upstream writes a 0-byte `.ignore` marker into each VFS root (VfsBuilder
+            // EnsureDirectory/CleanVfsRoot) so Shoko never imports the generated tree.
+            var rootFiles = Directory.GetFiles(_mountPoint).Select(Path.GetFileName).ToArray();
+            Assert.Equal(new[] { ".ignore" }, rootFiles);
+            Assert.Equal("", File.ReadAllText(Path.Combine(_mountPoint, ".ignore")));
+
             var tvSeries = Path.Combine(_mountPoint, "111");
             var tvSeason = Path.Combine(tvSeries, "Season 1");
             Assert.Equal(new[] { "Season 1" }, Directory.GetDirectories(tvSeries).Select(Path.GetFileName));

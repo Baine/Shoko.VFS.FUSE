@@ -118,13 +118,12 @@ public sealed class ThemeMp3ExposeTests
             Assert.Single(structure);
             Assert.Empty(structure[0].Mappings);
 
-            // Extras live on the lazily fetched per-series data.
+            // Extras live on the lazily fetched per-series data (as per-mapping SeriesAssets).
             var s = ds.GetSeriesData(structure[0].SeriesId);
             Assert.NotNull(s);
-            Assert.NotNull(s!.Extras);
-            Assert.Single(s.Extras!);
-            Assert.Equal("Theme.mp3", s.Extras![0].Name);
-            Assert.Equal(Path.Combine(seriesFolder, "Theme.mp3"), s.Extras![0].SourcePath);
+            var theme = Assert.Single(s!.Mappings.SelectMany(mapping => mapping.SeriesAssets ?? []));
+            Assert.Equal("Theme.mp3", theme.Name);
+            Assert.Equal(Path.Combine(seriesFolder, "Theme.mp3"), theme.SourcePath);
 
             var resolver = new ShokoPathResolver(ds, new RelayNamingStrategy());
             resolver.Rebuild();

@@ -67,8 +67,33 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
     /// <summary>File id → cross-referenced series ids, from the structure pass' file listing. Immutable swap.</summary>
     private volatile IReadOnlyDictionary<int, int[]> _fileSeriesIndex = new Dictionary<int, int[]>();
 
+    /// <summary>
+    /// Absolute paths of every file location indexed in this managed folder (structure pass).
+    /// Approximates upstream's <c>videoService.GetVideoFileByAbsolutePath</c> check when the
+    /// asset linker decides whether a physical file is Shoko-managed.
+    /// </summary>
+    private volatile IReadOnlySet<string> _indexedSourcePaths = new HashSet<string>(StringComparer.Ordinal);
+
     /// <summary>Last non-empty structure-pass series count, to detect flapping to empty.</summary>
     private int _lastSeriesCount;
+
+    // Upstream ShokoRelayConstants.cs:21 PluginId / :62 FileAtMapping (+ plugin display name).
+    private const string ShokoRelayPluginId = "2b0f5a7e-3d2b-4f3d-9e6b-7f0a6b2d8c9a";
+    private const string ShokoRelayPluginName = "Shoko Relay";
+    private const string AnimeThemesXrefCsvFileName = "anidb_animethemes_xrefs.csv";
+
+    /// <summary>Once-per-datasource AnimeThemes xref CSV resolution (cached; never throws).</summary>
+    private readonly Lazy<Task<string?>> _animeThemesCsv;
+
+    /// <summary>
+    /// Outcome of the one-shot AnimeThemes xref CSV resolution, for daemon diagnostics:
+    /// <c>pending</c> (structure pass has not run yet), <c>explicit</c>, <c>discovered</c>,
+    /// <c>not-found</c>, or <c>unconfigured</c>.
+    /// </summary>
+    public string AnimeThemesXrefCsvStatus { get; private set; } = "pending";
+
+    /// <summary>The resolved CSV path once <see cref="AnimeThemesXrefCsvStatus"/> says explicit/discovered; else null.</summary>
+    public string? AnimeThemesXrefCsvPath { get; private set; }
 
     public ShokoRelayDataSource(ShokoRestClient client, RelayPathDataSourceOptions options,
         TimeSpan cacheTtl = default, int maxDegree = 4,
@@ -103,6 +128,9 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         if (snapshotStore is not null && string.IsNullOrWhiteSpace(snapshotKey))
             throw new ArgumentException("snapshotKey required when snapshotStore is set.", nameof(snapshotKey));
         _pathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        _indexedSourcePaths = new HashSet<string>(StringComparer.FromComparison(_pathComparison));
+        _animeThemesCsv = new Lazy<Task<string?>>(
+            ResolveAnimeThemesXrefCsvAsync, LazyThreadSafetyMode.ExecutionAndPublication);
         // The cache now fronts the cheap structure pass only; per-series data has its own
         // per-id cache below. Snapshot persistence is handled directly against the store
         // (it persists structure + warm per-series entries combined).
@@ -305,6 +333,11 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         if (!IsEligibleManagedFolder())
             return [];
 
+        // One-shot AnimeThemes xref CSV resolution (cached in the Lazy; never throws), so
+        // the status is observable after the first structure build and the per-series
+        // linker pass reuses it without another API round-trip.
+        _ = await _animeThemesCsv.Value.ConfigureAwait(false);
+
         // Seed: series that have at least one file located in this managed folder.
         // Also builds the file→series xref index used for per-file event invalidation.
         var folderFiles = await _client.GetManagedFolderFilesAsync(_managedFolderId).ConfigureAwait(false);
@@ -335,10 +368,12 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                     : $"{folderFiles.Count} files listed but none cross-referenced to a series (xrefs not materialized?)";
                 ThrowIfTransientEmpty(0, verified, detail);
                 _fileSeriesIndex = fileSeries;
+                _indexedSourcePaths = BuildIndexedSourcePaths(folderFiles);
                 return [];
             }
         }
         _fileSeriesIndex = fileSeries;
+        _indexedSourcePaths = BuildIndexedSourcePaths(folderFiles);
 
         bool enforceTmdbNumbering = _options.TmdbEpNumbering || _options.MergeTmdbSeries;
         var manualOverrides = enforceTmdbNumbering ? _options.ManualOverrideGroups : [];
@@ -396,32 +431,25 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         }
 
         // Movie folder names are FormatMovieFolder(main episode id): fetch a bare episode
-        // listing per movie member and synthesize one placeholder mapping per main episode
-        // that has a source file in this managed folder — exactly the folder set ShokoRelay
-        // creates (one folder per sourced EpisodeType.Episode mapping). File-less mains and
-        // specials produce no folder, matching VfsBuilder's skip rules. Extras and real
-        // files belong to the per-series pass.
-        var eligibleEpisodeIds = CollectEligibleEpisodeIds(folderFiles);
+        // listing per movie member and synthesize one placeholder mapping per file-mapping
+        // primary — the earliest cross-referenced episode of each eligible file (upstream
+        // DeduplicateByCoords reorders unconditionally; coordinates never pick the
+        // primary) — matching the `mainEpIds` rule in ShokoRelay's VfsShared.cs.
+        // File-less mains and specials produce no folder, matching VfsBuilder's skip
+        // rules. Extras and real files belong to the per-series pass.
+        var eligibleFileEpisodeIds = CollectEligibleEpisodeIds(folderFiles, out var eligibleSeriesIds);
         var moviePlaceholders = new ConcurrentDictionary<int, IReadOnlyList<EpisodeData>>();
         await Parallel.ForEachAsync(
             groups.Where(group => group.Data.IsMovie),
             new ParallelOptions { MaxDegreeOfParallelism = _maxDegree, CancellationToken = ct },
             async (group, _) =>
             {
-                var mappings = new List<EpisodeData>();
+                var fetched = new List<ShokoEpisodeDto>();
                 foreach (var memberId in group.SeriesIds)
                 {
                     try
                     {
-                        var episodes = await _client.GetSeriesEpisodesAniDbAsync(memberId).ConfigureAwait(false);
-                        foreach (var episode in episodes)
-                        {
-                            if (episode.AniDB?.Type != EpisodeType.Episode)
-                                continue;
-                            if (!eligibleEpisodeIds.Contains(episode.IDs.ID))
-                                continue;
-                            mappings.Add(SyntheticMovieMapping(episode));
-                        }
+                        fetched.AddRange(await _client.GetSeriesEpisodesAniDbAsync(memberId).ConfigureAwait(false));
                     }
                     catch
                     {
@@ -429,11 +457,70 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                         // the structure until the next rebuild; the per-series pass still works.
                     }
                 }
+
+                // Episode types for candidate filtering. Hidden episodes are no mapping
+                // inputs upstream (MapHelper.cs:144), so they can never anchor either;
+                // specials stay in play as candidates — a special primary simply anchors
+                // no folder, exactly like upstream's `m.PrimaryEpisode.Type` filter.
+                var episodeInfo = new Dictionary<int, EpisodeType>();
+                foreach (var episode in fetched)
+                {
+                    if (episode.AniDB is { } anidb && !episode.IsHidden)
+                        episodeInfo[episode.IDs.ID] = anidb.Type;
+                }
+
+                var memberSeries = group.SeriesIds.ToHashSet();
+                var anchorSet = new HashSet<int>();
+                foreach (var coverage in eligibleFileEpisodeIds)
+                {
+                    // Candidates keep the file's xref order (SeriesIDs[].EpisodeIDs list),
+                    // so [0] is the earliest cross-referenced episode.
+                    // ponytail: ids of a failed member fetch drop out, so a shifted
+                    // primary is possible; the per-series pass still serves the file.
+                    var candidates = coverage.Where(c => episodeInfo.ContainsKey(c.EpisodeId)).ToList();
+                    if (candidates.Count == 0)
+                        continue;
+
+                    // Upstream multi-type filter (MapHelper.BuildFileMappings), gated
+                    // exactly: >1 episode, mixed types, and >1 distinct PRIMARY series —
+                    // in the lite pass approximated by >1 group-member series (members
+                    // share one primary). Keep only the earliest-xref episode's type.
+                    if (candidates.Count > 1
+                        && candidates.Select(c => episodeInfo[c.EpisodeId]).Distinct().Count() > 1
+                        && candidates.Select(c => c.SeriesId).Where(memberSeries.Contains).Distinct().Count() > 1)
+                    {
+                        var primaryType = episodeInfo[candidates[0].EpisodeId];
+                        candidates = [.. candidates.Where(c => episodeInfo[c.EpisodeId] == primaryType)];
+                    }
+
+                    // Primary = first surviving candidate: upstream DeduplicateByCoords
+                    // moves the earliest cross-reference to index 0 unconditionally
+                    // (MapHelper.cs:261-270), so xref order — not coordinates — picks it.
+                    var first = candidates[0];
+                    if (episodeInfo[first.EpisodeId] == EpisodeType.Episode)
+                        anchorSet.Add(first.EpisodeId);
+                }
+
+                var mappings = new List<EpisodeData>();
+                foreach (var episode in fetched)
+                {
+                    if (episode.AniDB?.Type != EpisodeType.Episode)
+                        continue;
+                    if (!anchorSet.Contains(episode.IDs.ID))
+                        continue;
+                    mappings.Add(SyntheticMovieMapping(episode));
+                }
                 if (mappings.Count > 0)
                     moviePlaceholders[group.PrimarySeriesId] = mappings;
             }).ConfigureAwait(false);
 
+        // Upstream builds a series folder only once at least one mapping passes
+        // TryResolveAndValidate (VfsBuilder BuildSeries/PruneSeries): a group no eligible
+        // file references must not surface as a mapping-less empty shell. The group maps
+        // keep dropped entries, so per-series lookups still route if files reappear.
         return groups
+            .Where(group => moviePlaceholders.ContainsKey(group.PrimarySeriesId)
+                || group.SeriesIds.Any(eligibleSeriesIds.Contains))
             .Select(group => moviePlaceholders.TryGetValue(group.PrimarySeriesId, out var placeholders)
                 ? group.Data with { Mappings = placeholders }
                 : group.Data)
@@ -463,11 +550,14 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
             var tmdbShowEpisodeCache = new ConcurrentDictionary<int, Task<IReadOnlyList<TmdbEpisodeDto>>>();
 
             var raw = new List<RelayRawSeries>();
+            var groupAnidbIds = new List<int>();
             foreach (var memberId in memberIds)
             {
                 var series = await _client.GetSeriesAsync(memberId).ConfigureAwait(false);
                 if (series is null)
                     continue;
+                if (series.AniDB?.ID > 0)
+                    groupAnidbIds.Add(series.AniDB.ID);
                 var episodes = await _client.GetSeriesEpisodesAsync(memberId).ConfigureAwait(false);
                 raw.Add(await ExtractSeriesAsync(series, episodes, folders, tmdbShowEpisodeCache, enforceTmdbNumbering).ConfigureAwait(false));
             }
@@ -483,11 +573,20 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
             if (result is null)
                 return null;
 
-            // AnimeThemes Theme.mp3 next to this group's own source files (probes each
-            // mapping's source folder once). Mirrors the symlink work ShokoRelay's
-            // AnimeThemesMp3Generator skips when Settings.Advanced.UseExternalVfs=true.
-            var theme = FindThemeFile(result.Mappings);
-            return theme is null ? result : result with { Extras = [theme] };
+            // Discovery-time mirror of upstream's VfsAssetLinker (episode sidecars and
+            // attachment folders, series-level artwork/metadata/Theme.mp3, Plex local extras,
+            // AnimeThemes Shorts). Probes each distinct source folder once, like FindThemeFile
+            // did, inside the per-series pass only — the structure pass stays cheap.
+            return RelayLocalAssetLinker.Discover(
+                result,
+                // Feed the linker the once-resolved CSV path (explicit or auto-discovered),
+                // never the raw option, so a stale explicit path cleanly disables Shorts.
+                _options with { AnimeThemesXrefCsvPath = await _animeThemesCsv.Value.ConfigureAwait(false) ?? "" },
+                _managedFolderRoot,
+                groupAnidbIds,
+                _pathComparison,
+                path => _indexedSourcePaths.Contains(path),
+                id => _memberToPrimary.GetValueOrDefault(id, id));
         }
         catch
         {
@@ -522,30 +621,20 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         "");
 
     /// <summary>
-    /// Probes the source folders behind a series' resolved mappings for a Theme.mp3 file
-    /// (first match wins) and returns it as a series-folder extra.
+    /// Absolute host paths of every location the managed-folder file listing reports for this
+    /// folder — the REST datasource's approximation of upstream's
+    /// <c>videoService.GetVideoFileByAbsolutePath</c> managed check (the daemon cannot query
+    /// arbitrary paths by absolute location over REST).
     /// </summary>
-    private ExtraFile? FindThemeFile(IReadOnlyList<EpisodeData> mappings)
+    private HashSet<string> BuildIndexedSourcePaths(IReadOnlyList<FileDto> files)
     {
-        var probedFolders = new HashSet<string>(StringComparer.FromComparison(_pathComparison));
-        foreach (var mapping in mappings)
-        {
-            if (mapping.FileId == 0 || string.IsNullOrEmpty(mapping.SourcePath))
-                continue;
-            string? sourceFolder = Path.GetDirectoryName(mapping.SourcePath);
-            if (sourceFolder is null || !probedFolders.Add(sourceFolder))
-                continue;
-
-            var themePath = Path.Combine(sourceFolder, "Theme.mp3");
-            if (!File.Exists(themePath))
-                continue;
-
-            long size;
-            try { size = new FileInfo(themePath).Length; }
-            catch { size = 0; }
-            return new ExtraFile("Theme.mp3", themePath, size);
-        }
-        return null;
+        var paths = new HashSet<string>(StringComparer.FromComparison(_pathComparison));
+        foreach (var file in files)
+            foreach (var location in file.Locations ?? [])
+                if (location.ManagedFolderID == _managedFolderId
+                    && TryResolveSource(location.RelativePath, out var resolved))
+                    paths.Add(resolved.AbsolutePath);
+        return paths;
     }
 
     private async Task<RelayRawSeries> ExtractSeriesAsync(
@@ -579,8 +668,11 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                     rawVideo = ExtractVideo(file, folders);
                     videos.Add(file.ID, rawVideo);
                 }
-                if (!rawVideo.IsExcluded)
-                    episodeVideos.Add(rawVideo);
+                // Upstream keeps location-excluded videos in the mapping inputs — they
+                // count toward part/dup indices — and drops them only at link time
+                // (ResolveSourcePath null, VfsShared.cs:74-88). Their SourcePath stays
+                // empty here, so the resolver publishes no entry for them.
+                episodeVideos.Add(rawVideo);
             }
 
             var episodeType = anidbEpisode.Type;
@@ -736,11 +828,15 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
     /// <summary>
     /// Mirror of VfsBuilder eligibility: a file only backs a movie folder when one of its
     /// locations sits in this managed folder, resolves to a contained path and is not
-    /// excluded. Returns the episode ids xref'd to such files.
+    /// excluded. Returns, per eligible file, its covered (episodeId, seriesId) pairs in
+    /// xref order (files without episode ids are skipped) so callers can pick each file
+    /// mapping's primary episode; <paramref name="eligibleSeriesIds"/> collects the series
+    /// those files reference, so the structure pass can drop untouched groups.
     /// </summary>
-    private HashSet<int> CollectEligibleEpisodeIds(IReadOnlyList<FileDto> files)
+    private List<List<(int EpisodeId, int SeriesId)>> CollectEligibleEpisodeIds(IReadOnlyList<FileDto> files, out HashSet<int> eligibleSeriesIds)
     {
-        var eligible = new HashSet<int>();
+        var eligible = new List<List<(int EpisodeId, int SeriesId)>>();
+        eligibleSeriesIds = new HashSet<int>();
         foreach (var file in files)
         {
             bool hasEligibleLocation = false;
@@ -750,7 +846,7 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                     continue;
                 if (!TryResolveSource(location.RelativePath, out var resolved))
                     continue;
-                if (IsPathExcluded(resolved.RelativePath))
+                if (IsPathExcluded(resolved.RelativePath, resolved.AbsolutePath))
                     continue;
                 hasEligibleLocation = true;
                 break;
@@ -758,15 +854,88 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
             if (!hasEligibleLocation)
                 continue;
 
-            foreach (var episodeId in (file.SeriesIDs ?? [])
-                         .SelectMany(group => group.EpisodeIDs, (_, episode) => episode.ID)
+            var covered = (file.SeriesIDs ?? [])
+                .SelectMany(group => group.EpisodeIDs, (group, episode) => (EpisodeId: episode.ID, SeriesId: group.SeriesID.ID))
+                .Where(coverage => coverage.EpisodeId is > 0)
+                .Select(coverage => (EpisodeId: coverage.EpisodeId!.Value, SeriesId: coverage.SeriesId ?? 0))
+                .ToList();
+            if (covered.Count == 0)
+                continue;
+            eligible.Add(covered);
+            foreach (var seriesId in (file.SeriesIDs ?? [])
+                         .Select(group => group.SeriesID.ID)
                          .Where(id => id is > 0)
                          .Select(id => id!.Value))
-            {
-                eligible.Add(episodeId);
-            }
+                eligibleSeriesIds.Add(seriesId);
         }
         return eligible;
+    }
+
+    /// <summary>
+    /// One-shot, cached resolution of the AnimeThemes xref CSV (host-side mirror of the
+    /// plugin's RelayRuntime auto-detection; the REST API only knows container-internal
+    /// paths, so the host-visible config base comes from options): (a) an existing explicit
+    /// path wins; (b) otherwise, with ShokoConfigDir set, ask GET /api/v3/Plugin for
+    /// ShokoRelay's plugin GUID (name fallback) and probe
+    /// <c>&lt;ShokoConfigDir&gt;/&lt;id&gt;/anidb_animethemes_xrefs.csv</c>; (c) on API
+    /// failure, missing plugin, or absent candidate, glob the config dirs. Null means Shorts
+    /// stay skipped, exactly like an unconfigured AnimeThemesXrefCsvPath today.
+    /// </summary>
+    private async Task<string?> ResolveAnimeThemesXrefCsvAsync()
+    {
+        var explicitPath = _options.AnimeThemesXrefCsvPath;
+        if (!string.IsNullOrWhiteSpace(explicitPath) && File.Exists(explicitPath))
+        {
+            AnimeThemesXrefCsvStatus = "explicit";
+            AnimeThemesXrefCsvPath = explicitPath;
+            return explicitPath;
+        }
+
+        var configDir = _options.ShokoConfigDir;
+        if (string.IsNullOrWhiteSpace(configDir))
+        {
+            AnimeThemesXrefCsvStatus = "unconfigured";
+            return null;
+        }
+
+        string? discovered = null;
+        try
+        {
+            var plugins = await _client.GetPluginsAsync().ConfigureAwait(false);
+            var relay = plugins.FirstOrDefault(plugin =>
+                           string.Equals(plugin.ID, ShokoRelayPluginId, StringComparison.OrdinalIgnoreCase))
+                       ?? plugins.FirstOrDefault(plugin =>
+                           string.Equals(plugin.Name, ShokoRelayPluginName, StringComparison.OrdinalIgnoreCase));
+            if (relay?.ID is { Length: > 0 } pluginId)
+            {
+                var candidate = Path.Combine(configDir, pluginId, AnimeThemesXrefCsvFileName);
+                if (File.Exists(candidate))
+                    discovered = candidate;
+            }
+        }
+        catch
+        {
+            // Best-effort discovery; fall through to the glob like a missing plugin.
+        }
+
+        if (discovered is null)
+        {
+            try
+            {
+                // ponytail: glob fallback — upstream ships exactly one plugin dir carrying
+                // this CSV, so first match wins.
+                discovered = Directory.EnumerateDirectories(configDir)
+                    .Select(dir => Path.Combine(dir, AnimeThemesXrefCsvFileName))
+                    .FirstOrDefault(File.Exists);
+            }
+            catch
+            {
+            }
+        }
+
+        AnimeThemesXrefCsvStatus = discovered is null ? "not-found" : "discovered";
+        AnimeThemesXrefCsvPath = discovered;
+        return discovered;
     }
 
     private bool IsEligibleManagedFolder()
@@ -779,12 +948,15 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
             || string.Equals(exclusion, _options.ManagedFolderName, StringComparison.OrdinalIgnoreCase));
     }
 
-    private bool IsPathExcluded(string path)
+    private bool IsPathExcluded(string path, string absoluteSourcePath)
     {
         var excluded = new HashSet<string>(SplitLines(_options.FolderExclusions), StringComparer.OrdinalIgnoreCase)
         {
             _options.RelayTvFolderName,
             _options.RelayMovieFolderName,
+            // Upstream GetIgnoredFolderNames also hides the two feature roots (VfsShared.cs:159-182).
+            RelayIgnoreRules.AnimeThemesRootName,
+            RelayIgnoreRules.CollectionImagesRootName,
         };
 
         foreach (var segment in path.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries))
@@ -795,7 +967,8 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                 return true;
         }
 
-        return false;
+        // Upstream IsPathIgnored tail: inline "-trailer"-style files next to a matching video.
+        return _options.PlexLocalExtras && RelayIgnoreRules.IsInlineLocalExtraFile(absoluteSourcePath);
     }
 
     private static IEnumerable<string> SplitLines(string? value) =>
@@ -883,11 +1056,11 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
     private RelayRawVideo ExtractVideo(FileDto file, IReadOnlyDictionary<int, ManagedFolderDto> folders)
     {
         var locations = file.Locations;
-        var selected = SelectSource(locations, file.Size, folders, out bool excluded);
-        var source = selected?.ManagedFolderId == _managedFolderId ? selected : null;
-        var sortPath = selected?.RelativePath ?? locations
-            .Select(location => NormalizeForSort(location.RelativePath))
-            .FirstOrDefault();
+                var selected = SelectSource(locations, file.Size, folders, out bool excluded);
+                var source = selected?.ManagedFolderId == _managedFolderId ? selected : null;
+                // Upstream sorts part/dup candidates by the FIRST physical location's
+                // basename, regardless of eligibility (MapHelper.cs:167-170).
+                var sortPath = NormalizeForSort(locations.FirstOrDefault()?.RelativePath);
         var crossReferences = (file.SeriesIDs ?? [])
             .SelectMany(group => group.EpisodeIDs, (group, episode) => new RelayRawCrossReference(episode.ID, group.SeriesID.ID))
             .ToArray();
@@ -907,7 +1080,7 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                 continue;
             if (!TryResolveSource(location.RelativePath, out var resolved))
                 continue;
-            if (IsPathExcluded(resolved.RelativePath))
+            if (IsPathExcluded(resolved.RelativePath, resolved.AbsolutePath))
             {
                 excluded = true;
                 return null;
@@ -962,6 +1135,10 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         {
             string candidate = Path.GetFullPath(Path.Combine(_managedFolderRoot, relative));
             if (!IsContained(candidate))
+                return false;
+            // Upstream ResolveSourcePath only resolves files that physically exist
+            // (VfsShared.cs:74-88); a stale DB row must not produce a VFS entry.
+            if (!File.Exists(candidate))
                 return false;
 
             source = new ResolvedSource(candidate, relative, Path.GetExtension(candidate));

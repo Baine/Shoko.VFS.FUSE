@@ -163,7 +163,7 @@ public sealed class OnePieceEndToEndDiagnostic
         }
         Assert.True(gerdubId > 0, "GerDub folder not found in test data");
 
-        var options = new RelayPathDataSourceOptions(gerdubId, "/mnt/user/array/Anime/Shows/GerDub/")
+        var options = new RelayPathDataSourceOptions(gerdubId, "/mnt/array/Anime/Shows/GerDub/")
         {
             ManagedFolderName = "Anime-Shows-GerDub",
             ManagedFolderType = Shoko.Abstractions.Video.Enums.DropFolderType.Destination,
@@ -241,7 +241,7 @@ public sealed class OnePieceEndToEndDiagnostic
         var http = new HttpClient(handler) { BaseAddress = new Uri("http://test/") };
         var client = new ShokoRestClient(http, "http://test/");
 
-        var options = new RelayPathDataSourceOptions(gerdubId, "/mnt/user/array/Anime/Shows/GerDub/")
+        var options = new RelayPathDataSourceOptions(gerdubId, "/mnt/array/Anime/Shows/GerDub/")
         {
             ManagedFolderName = "Anime-Shows-GerDub",
             ManagedFolderType = Shoko.Abstractions.Video.Enums.DropFolderType.Destination,

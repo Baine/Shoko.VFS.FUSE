@@ -51,6 +51,26 @@ public sealed class HostConfig
     /// <summary>Whether Relay applies Plex local-extra exclusions to indexed files. Default: <c>true</c>.</summary>
     public bool PlexLocalExtras { get; set; } = true;
 
+    /// <summary>
+    /// Absolute path to ShokoRelay's <c>anidb_animethemes_xrefs.csv</c> (its plugin config
+    /// directory, e.g. <c>&lt;ShokoData&gt;/configuration/2b0f5a7e-3d2b-4f3d-9e6b-7f0a6b2d8c9a/anidb_animethemes_xrefs.csv</c>).
+    /// When set and readable, the daemon exposes AnimeThemes <c>Shorts/*.webm</c> in every
+    /// series/movie folder like upstream's VFS. Preferred over auto-discovery; when unset or
+    /// missing, the daemon resolves the CSV via <see cref="ShokoConfigDir"/>.
+    /// </summary>
+    public string AnimeThemesXrefCsvPath { get; set; } = "";
+
+    /// <summary>
+    /// Host-visible path to Shoko's <c>configuration</c> directory root (e.g.
+    /// <c>/mnt/cache/appdata/shokoserver/Shoko.CLI/configuration</c>). The daemon lists
+    /// installed plugins over <c>GET /api/v3/Plugin</c>, finds ShokoRelay's plugin GUID
+    /// directory there, and reads <c>anidb_animethemes_xrefs.csv</c> from it automatically
+    /// (glob fallback if the API is unavailable). Empty leaves only
+    /// <see cref="AnimeThemesXrefCsvPath"/>. The REST API only exposes container-internal
+    /// paths, so this host-visible base must be supplied — the daemon never guesses it.
+    /// </summary>
+    public string ShokoConfigDir { get; set; } = "";
+
     /// <summary>Newline-separated source path segments excluded from Relay indexing.</summary>
     public string FolderExclusions { get; set; } = "";
 

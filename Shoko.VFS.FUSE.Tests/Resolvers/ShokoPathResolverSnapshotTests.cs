@@ -144,7 +144,8 @@ public sealed class ShokoPathResolverSnapshotTests
         try
         {
             int calls = source.BuildCalls;
-            Assert.Empty(resolver.ReadDirectory(""));
+            // Relay roots carry the upstream `.ignore` marker even when empty.
+            Assert.Equal(new[] { ".ignore" }, resolver.ReadDirectory("").Select(e => e.Name));
             Assert.Null(resolver.Lookup("missing"));
             Thread.Sleep(50);
             Assert.Equal(calls, source.BuildCalls);

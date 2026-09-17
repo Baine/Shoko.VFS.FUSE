@@ -138,7 +138,7 @@ public sealed class RelayShokoPathDataSourceLazyTests
             var first = dataSource.GetSeriesData(1);
             Assert.NotNull(first);
             Assert.NotEmpty(first!.Mappings);
-            var extra = Assert.Single(first.Extras!);
+            var extra = Assert.Single(first.Mappings.SelectMany(mapping => mapping.SeriesAssets ?? []));
             Assert.Equal("Theme.mp3", extra.Name);
             Assert.Equal(Path.Combine(root, "tv", "Theme.mp3"), extra.SourcePath);
             Assert.Equal(1, metadata.GetByIdCalls);

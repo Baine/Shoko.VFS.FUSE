@@ -76,7 +76,11 @@ internal static class RelayMappingProjector
         var videos = visibleEpisodes
             .SelectMany(episode => episode.Videos)
             .DistinctBy(video => video.VideoId)
-            .OrderBy(video => FileNameSortKey(video.SortPath), StringComparer.Ordinal)
+            // Upstream orders part/dup candidates by basename with the default culture
+            // comparer (MapHelper.cs:169-170); keep the VideoId tiebreak for exact-name
+            // ties (ponytail: upstream lacks it, but its stable sort hides input-order
+            // nondeterminism).
+            .OrderBy(video => FileNameSortKey(video.SortPath), StringComparer.CurrentCulture)
             .ThenBy(video => video.VideoId)
             .ToList();
         bool hasSeasonOne = visibleEpisodes.Any(episode => coordinates[episode.EpisodeId].Season == 1);
@@ -132,7 +136,7 @@ internal static class RelayMappingProjector
             int partCount = episodeVideoCounts.GetValueOrDefault(primary.EpisodeId);
             var firstEpisodeVideos = primary.Videos
                 .DistinctBy(candidate => candidate.VideoId)
-                .OrderBy(candidate => FileNameSortKey(candidate.SortPath), StringComparer.Ordinal)
+                .OrderBy(candidate => FileNameSortKey(candidate.SortPath), StringComparer.CurrentCulture)
                 .ThenBy(candidate => candidate.VideoId)
                 .ToList();
             int partIndex = firstEpisodeVideos.FindIndex(candidate => candidate.VideoId == video.VideoId);
@@ -140,6 +144,14 @@ internal static class RelayMappingProjector
                 && partIndex >= 0
                 && deduped.Select(entry => entry.Episode.Type).Distinct().Count() <= 1
                 && IsSplitVideo(video);
+
+            // Upstream's asset-link gate reads the file's episode cross-references
+            // (VfsBuilder.cs:490-492); carry the series ids so discovery can resolve primaries.
+            var xrefSeriesIds = video.CrossReferences
+                .Where(reference => reference.EpisodeId.HasValue && reference.SeriesId.HasValue)
+                .Select(reference => reference.SeriesId!.Value)
+                .Distinct()
+                .ToArray();
 
             mappings.Add(
                 new EpisodeData(
@@ -155,7 +167,8 @@ internal static class RelayMappingProjector
                     primary.Title,
                     video.SourcePath,
                     video.Size,
-                    video.Extension
+                    video.Extension,
+                    XrefSeriesIds: xrefSeriesIds.Length > 0 ? xrefSeriesIds : null
                 )
             );
         }

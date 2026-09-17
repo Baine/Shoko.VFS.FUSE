@@ -178,6 +178,15 @@ public sealed class DaemonOrchestrator : IAsyncDisposable
                     token.ThrowIfCancellationRequested();
                     var snapshot = await dataSource.GetAllSeriesAsync().ConfigureAwait(false);
 
+                    // Surface undetected AnimeThemes xref CSVs like the planner's
+                    // LocalExtrasUnsupported diagnostic: the Shorts tree will diverge from
+                    // ShokoRelay's, and it should never be a silent difference.
+                    if (dataSource.AnimeThemesXrefCsvStatus is not ("pending" or "explicit" or "discovered"))
+                        _logger.LogWarning(
+                            "[Warmup {Folder}] AnimeThemes xref CSV unavailable (status: {Status}); Shorts are skipped and the tree diverges from ShokoRelay. Set ShokoConfigDir (host-visible Shoko configuration root) or AnimeThemesXrefCsvPath in the host config.",
+                            first.ManagedFolderName,
+                            dataSource.AnimeThemesXrefCsvStatus);
+
                     if (!PathValidation.ValidatePaths(snapshot, _config.PathValidationSamples,
                             _config.PathValidationMaxPathLength,
                             msg => _logger.LogWarning("[Warmup {Folder}] {Message}", first.ManagedFolderName, msg)))

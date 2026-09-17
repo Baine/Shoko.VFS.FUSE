@@ -164,9 +164,10 @@ internal static class RelayMountOperationsFactory
     internal static RelayMountOperations Create(
         IMetadataService metadataService,
         ILoggerFactory loggerFactory,
-        Shoko.Abstractions.Video.Services.IVideoService? videoService = null) =>
+        Shoko.Abstractions.Video.Services.IVideoService? videoService = null,
+        string animeThemesXrefCsvPath = "") =>
         new((target, configuration, manualOverrides, cancellationToken, stopped, daemonStopped, cleanupCompleted) =>
-            StartAsync(metadataService, videoService, loggerFactory, target, configuration, manualOverrides, cancellationToken, stopped, daemonStopped, cleanupCompleted));
+            StartAsync(metadataService, videoService, loggerFactory, target, configuration, manualOverrides, cancellationToken, stopped, daemonStopped, cleanupCompleted, animeThemesXrefCsvPath));
 
     private static async Task<RelayMountLease> StartAsync(
         IMetadataService metadataService,
@@ -178,7 +179,8 @@ internal static class RelayMountOperationsFactory
         CancellationToken cancellationToken,
         Action stopped,
         Action daemonStopped,
-        Action cleanupCompleted)
+        Action cleanupCompleted,
+        string animeThemesXrefCsvPath)
     {
         var dataSource = new RelayShokoPathDataSource(
             metadataService,
@@ -199,6 +201,7 @@ internal static class RelayMountOperationsFactory
                 TmdbEpGroupNames = configuration.TmdbEpGroupNames,
                 ManualOverrideGroups = manualOverrides,
                 SeriesCacheTtl = target.ResolverOptions.SeriesCacheTtl,
+                AnimeThemesXrefCsvPath = animeThemesXrefCsvPath,
             },
             videoService
         );

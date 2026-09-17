@@ -38,7 +38,7 @@ public sealed class RelayMappingProjectorTests
         );
         var resolver = Resolver(data);
 
-        Assert.Equal(new[] { "10" }, Names(resolver.ReadDirectory("")));
+        Assert.Equal(new[] { "10", ".ignore" }, Names(resolver.ReadDirectory("")));
         Assert.Equal(new[] { "Other", "Featurettes", "Scenes", "Trailers", "Shorts", "Specials", "Season 1", "Season 2" }, Names(resolver.ReadDirectory("10")));
         Assert.Equal(new[] { "S01E01 [1].mkv" }, Names(resolver.ReadDirectory("10/Season 1")));
         Assert.Equal(new[] { "S02E03 [2].mkv" }, Names(resolver.ReadDirectory("10/Season 2")));
@@ -258,7 +258,19 @@ public sealed class RelayMappingProjectorTests
         var data = Project(new RelayRawSeries(60, AnimeType.TV, "Missing", [Episode(601, EpisodeType.Episode, 1, 1, "Missing", Video(61, "/source/missing.mkv") with { SourcePath = null })]));
 
         Assert.Null(data.Mappings.Single().SourcePath);
-        Assert.Empty(Resolver(data).ReadDirectory(""));
+        Assert.Equal(new[] { ".ignore" }, Names(Resolver(data).ReadDirectory("")));
+    }
+
+    [Fact]
+    public void Project_OrdersPartAndDupCandidatesWithTheCultureComparer_MirroringUpstream()
+    {
+        // F9: upstream sorts videos by basename with the default (culture) comparer
+        // (MapHelper.cs:169-170) — ordinal would put "b.mkv" before "A.mkv".
+        var lower = Video(21, "/source/b.mkv");
+        var upper = Video(22, "/source/A.mkv");
+        var data = Project(new RelayRawSeries(40, AnimeType.TV, "Pad", [Episode(401, EpisodeType.Episode, 1, 1, "Ep", lower, upper)]));
+
+        Assert.Equal(new[] { 22, 21 }, data.Mappings.Select(mapping => mapping.FileId).ToArray());
     }
 
     private static RelayRawEpisode Episode(int id, EpisodeType type, int number, int? season, string title, params RelayRawVideo[] videos) =>

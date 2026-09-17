@@ -224,6 +224,7 @@ public sealed class RelayShokoPathDataSourceTests
         string root = NewDirectory();
         try
         {
+            string localPath = WriteFile(root, "local.mkv");
             var primary = Series(
                 140,
                 AnimeType.TV,
@@ -257,6 +258,7 @@ public sealed class RelayShokoPathDataSourceTests
         string root = NewDirectory();
         try
         {
+            string localPath = WriteFile(root, "local.mkv");
             var primary = SeriesWithTmdb(
                 150,
                 AnimeType.TV,
@@ -300,6 +302,7 @@ public sealed class RelayShokoPathDataSourceTests
         string root = NewDirectory();
         try
         {
+            string localPath = WriteFile(root, "local.mkv");
             var primary = Series(
                 160,
                 AnimeType.TV,
@@ -497,7 +500,10 @@ public sealed class RelayShokoPathDataSourceTests
             var options = new RelayPathDataSourceOptions(7, root) { FolderExclusions = "blocked" };
             var data = new RelayShokoPathDataSource(Metadata(series), options).GetAllSeries().Single();
 
-            Assert.Equal(new[] { 601 }, data.Mappings.Select(mapping => mapping.FileId));
+            // F10 mirror: location-excluded videos stay in the mapping inputs (they count
+            // toward part/dup indices) with an empty SourcePath so no VFS entry is published.
+            Assert.Equal(new[] { 601, 602, 603, 604 }, data.Mappings.Select(mapping => mapping.FileId).OrderBy(id => id));
+            Assert.Equal(new[] { 601 }, data.Mappings.Where(mapping => !string.IsNullOrWhiteSpace(mapping.SourcePath)).Select(mapping => mapping.FileId));
 
             Assert.Empty(
                 new RelayShokoPathDataSource(
@@ -892,6 +898,7 @@ public sealed class RelayShokoPathDataSourceTests
         string root = NewDirectory();
         try
         {
+            string validPath = WriteFile(root, "missing.mkv");
             var valid = Video(206, [Location(7, false, "/must-not-read", "/missing.mkv", 456, throwOnSourceProbe: true)]);
             var wrongFolder = Video(207, [Location(99, false, "/must-not-read", "/wrong-folder.mkv", 789, throwOnSourceProbe: true)]);
             var traversal = Video(208, [Location(7, false, "/must-not-read", "../outside.mkv", 987, throwOnSourceProbe: true)]);
@@ -927,6 +934,7 @@ public sealed class RelayShokoPathDataSourceTests
         string root = NewDirectory();
         try
         {
+            string secondPath = WriteFile(root, "second.mkv");
             var video = Video(
                 209,
                 [
@@ -971,7 +979,10 @@ public sealed class RelayShokoPathDataSourceTests
                 .GetAllSeries().Single().Mappings.Single();
 
             Assert.Equal(Path.Combine(firstRoot, "first.mkv"), firstMapping.SourcePath);
-            Assert.Null(secondMapping.SourcePath);
+            // Mirror of the host datasource (File.Exists gate, F10): the first location's
+            // reconstructed path does not exist under the second root, so selection falls
+            // through to the local location instead of blocking the mount.
+            Assert.Equal(Path.Combine(secondRoot, "second.mkv"), secondMapping.SourcePath);
         }
         finally
         {
@@ -986,6 +997,8 @@ public sealed class RelayShokoPathDataSourceTests
         string root = NewDirectory();
         try
         {
+            string excludedPath = WriteFile(root, Path.Combine("Excluded", "first.mkv"));
+            string okPath = WriteFile(root, "ok.mkv");
             var excluded = Video(
                 211,
                 [
@@ -1004,8 +1017,10 @@ public sealed class RelayShokoPathDataSourceTests
             var data = new RelayShokoPathDataSource(Metadata(series), options).GetAllSeries();
 
             var single = Assert.Single(data);
-            Assert.Single(single.Mappings, mapping => mapping.FileId == 2110);
-            Assert.DoesNotContain(single.Mappings, mapping => mapping.FileId == 211);
+            var okMapping = Assert.Single(single.Mappings, mapping => mapping.FileId == 2110);
+            Assert.Equal(Path.Combine(root, "ok.mkv"), okMapping.SourcePath);
+            // F10 mirror: the excluded video stays as a mapping input with an empty SourcePath.
+            Assert.True(string.IsNullOrWhiteSpace(Assert.Single(single.Mappings, mapping => mapping.FileId == 211).SourcePath));
         }
         finally
         {
@@ -1019,6 +1034,7 @@ public sealed class RelayShokoPathDataSourceTests
         string root = NewDirectory();
         try
         {
+            string folder7Path = WriteFile(root, "folder7.mkv");
             var video = Video(
                 212,
                 [
@@ -1283,10 +1299,11 @@ public sealed class RelayShokoPathDataSourceTests
             var all = ds.GetAllSeries();
             Assert.Single(all);
             var s = all[0];
-            Assert.NotNull(s.Extras);
-            Assert.Single(s.Extras!);
-            Assert.Equal("Theme.mp3", s.Extras![0].Name);
-            Assert.Equal(themePath, s.Extras![0].SourcePath);
+            // Series-level assets (Theme.mp3 etc.) are discovered per mapping from its source
+            // folder and aggregated at the series/movie roots by the resolver.
+            var extra = Assert.Single(s.Mappings.SelectMany(mapping => mapping.SeriesAssets ?? []));
+            Assert.Equal("Theme.mp3", extra.Name);
+            Assert.Equal(themePath, extra.SourcePath);
         }
         finally
         {

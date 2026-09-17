@@ -140,7 +140,9 @@ public sealed class ShokoFuseFileSystem : IFuseOperations
         readLength = 0;
         var sourcePath = fileInfo.Context as string;
         if (string.IsNullOrEmpty(sourcePath))
-            return PosixResult.EIO;
+            // Synthetic 0-byte marker files (the relay root `.ignore`) hit EOF immediately;
+            // every served real mapping carries a source path.
+            return PosixResult.Success;
 
         try
         {

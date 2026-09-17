@@ -65,6 +65,19 @@ public sealed class ManagedFolderDto
     public long FileSize { get; set; }
 }
 
+/// <summary>
+/// <c>GET /api/v3/Plugin</c> entry. <c>ID</c> is the plugin's GUID — also the name of its
+/// config directory under Shoko's <c>configuration</c> root.
+/// </summary>
+public sealed class ShokoPluginDto
+{
+    public string? ID { get; set; }
+
+    public string? Name { get; set; }
+
+    public string? Version { get; set; }
+}
+
 #endregion
 
 #region Series (Models/Shoko/Series.cs + Models/AniDB/AnidbAnime.cs)

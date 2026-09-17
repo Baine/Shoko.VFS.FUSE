@@ -36,6 +36,8 @@ public static class DaemonMounter
             TmdbEpNumbering = config.TmdbEpNumbering,
             MergeTmdbSeries = config.MergeTmdbSeries,
             PlexLocalExtras = config.PlexLocalExtras,
+            AnimeThemesXrefCsvPath = config.AnimeThemesXrefCsvPath ?? "",
+            ShokoConfigDir = config.ShokoConfigDir ?? "",
             FolderExclusions = config.FolderExclusions,
             ManagedFolderExclusions = config.ManagedFolderExclusions,
             RelayTvFolderName = config.RelayTvFolderName,

@@ -40,8 +40,7 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
             Assert.Single(all);
             var s = all[0];
 
-            Assert.NotNull(s.Extras);
-            var extra = Assert.Single(s.Extras!);
+            var extra = Assert.Single(s.Mappings.SelectMany(mapping => mapping.SeriesAssets ?? []));
             Assert.Equal("Theme.mp3", extra.Name);
             Assert.Equal(themePath, extra.SourcePath);
         }
@@ -99,9 +98,11 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
             var ds = new RelayShokoPathDataSource(Metadata(series), new RelayPathDataSourceOptions(7, root));
             var all = ds.GetAllSeries();
             Assert.Single(all);
-            var extras = all[0].Extras;
-            Assert.NotNull(extras);
-            Assert.Single(extras!);
+            // Same folder probed once: both mappings' SeriesAssets point at the same file,
+            // deduplicated by name when the resolver aggregates them at the series root.
+            var extras = all[0].Mappings.SelectMany(mapping => mapping.SeriesAssets ?? []).ToList();
+            Assert.Single(extras);
+            Assert.Equal("Theme.mp3", extras[0].Name);
         }
         finally
         {
@@ -144,11 +145,13 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
             var sa = all.First(s => s.SeriesId == 55);
             var sb = all.First(s => s.SeriesId == 66);
 
-            Assert.NotNull(sa.Extras);
-            Assert.Equal(Path.Combine(aDir, "Theme.mp3"), sa.Extras![0].SourcePath);
+            Assert.Equal(
+                Path.Combine(aDir, "Theme.mp3"),
+                Assert.Single(sa.Mappings.SelectMany(mapping => mapping.SeriesAssets ?? [])).SourcePath);
 
-            Assert.NotNull(sb.Extras);
-            Assert.Equal(Path.Combine(bDir, "Theme.mp3"), sb.Extras![0].SourcePath);
+            Assert.Equal(
+                Path.Combine(bDir, "Theme.mp3"),
+                Assert.Single(sb.Mappings.SelectMany(mapping => mapping.SeriesAssets ?? [])).SourcePath);
         }
         finally
         {

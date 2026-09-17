@@ -14,7 +14,7 @@ public class ShokoPathResolverLazyTests
         source.SetStructure(StructureSeries(1234), StructureSeries(5678));
         var resolver = Ready(new ShokoPathResolver(source, new RelayNamingStrategy()));
 
-        Assert.Equal(new[] { "1234", "5678" }, Names(resolver.ReadDirectory("")));
+        Assert.Equal(new[] { "1234", "5678", ".ignore" }, Names(resolver.ReadDirectory("")));
         Assert.Equal(0, source.TotalFetches);
         // Series folder itself is served from the structure tree (no fetch for getattr).
         Assert.NotNull(resolver.Lookup("1234"));
@@ -120,7 +120,7 @@ public class ShokoPathResolverLazyTests
             new PathResolverOptions { Shows = true, MoviesAsTv = false, StandaloneMovies = true }
         ));
 
-        Assert.Equal(new[] { "1234", "900" }, Names(resolver.ReadDirectory("")));
+        Assert.Equal(new[] { "1234", "900", ".ignore" }, Names(resolver.ReadDirectory("")));
         Assert.Equal(new[] { "Theme.mp3", "Movie [21].mkv" }, Names(resolver.ReadDirectory("900")));
         Assert.Equal(1, source.FetchCount(5));
         Assert.Equal(0, source.FetchCount(1234));
@@ -148,7 +148,7 @@ public class ShokoPathResolverLazyTests
         var source = new EagerDataSource([FullSeries(1234)]);
         var resolver = Ready(new ShokoPathResolver(source, new RelayNamingStrategy()));
 
-        Assert.Equal(new[] { "1234" }, Names(resolver.ReadDirectory("")));
+        Assert.Equal(new[] { "1234", ".ignore" }, Names(resolver.ReadDirectory("")));
         Assert.Equal(new[] { "Season 1" }, Names(resolver.ReadDirectory("1234")));
         Assert.Equal("/source/101.mkv", resolver.GetSourcePath("1234/Season 1/S01E01 [101].mkv"));
     }
