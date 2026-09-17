@@ -166,11 +166,11 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
     }
 
     /// <summary>
-    /// Structure-only pass: series/movie directory nodes with empty mappings, so the
+    /// Structure-only pass: series/movie directory nodes with empty TV mappings, so the
     /// resolver can publish the mount layout without materializing any TV series'
-    /// episodes/videos/files. Movie-closure groups carry exactly one real main mapping
-    /// (the resolver skips source-less mappings when building movie folders, so the
-    /// episode-ID folder would otherwise never appear for routing).
+    /// episodes/videos/files. Movie-closure groups carry every sourced main mapping
+    /// (one folder per mapping in the relay tree, so the episode-ID folders must all
+    /// appear for routing and root listing parity).
     /// </summary>
     public IReadOnlyList<SeriesData> GetSeriesStructure()
     {
@@ -270,9 +270,10 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
                 ? [RelayMappingProjector.Project(raws[0])]
                 : BuildGroups(raws).Select(group => group.Data))
             .SelectMany(series => series.Mappings ?? []);
-        var main = mappings.FirstOrDefault(mapping => mapping.IsMain && !string.IsNullOrWhiteSpace(mapping.SourcePath))
-            ?? mappings.FirstOrDefault(mapping => !string.IsNullOrWhiteSpace(mapping.SourcePath));
-        return main is null ? [] : [main];
+        var main = mappings
+            .Where(mapping => mapping.IsMain && !string.IsNullOrWhiteSpace(mapping.SourcePath))
+            .ToArray();
+        return main;
     }
 
     private bool IsFresh(SeriesCacheEntry entry) =>

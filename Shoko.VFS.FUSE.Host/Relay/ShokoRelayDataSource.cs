@@ -396,9 +396,12 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         }
 
         // Movie folder names are FormatMovieFolder(main episode id): fetch a bare episode
-        // listing per movie member and synthesize one placeholder mapping so the resolver
-        // lists the folder (and routes accesses into the lazy subtree). Extras and real
+        // listing per movie member and synthesize one placeholder mapping per main episode
+        // that has a source file in this managed folder — exactly the folder set ShokoRelay
+        // creates (one folder per sourced EpisodeType.Episode mapping). File-less mains and
+        // specials produce no folder, matching VfsBuilder's skip rules. Extras and real
         // files belong to the per-series pass.
+        var eligibleEpisodeIds = CollectEligibleEpisodeIds(folderFiles);
         var moviePlaceholders = new ConcurrentDictionary<int, IReadOnlyList<EpisodeData>>();
         await Parallel.ForEachAsync(
             groups.Where(group => group.Data.IsMovie),
@@ -410,9 +413,15 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                 {
                     try
                     {
-                        var episodes = await _client.GetSeriesEpisodesLiteAsync(memberId).ConfigureAwait(false);
-                        if (PickMainEpisode(episodes) is { } main)
-                            mappings.Add(SyntheticMovieMapping(main));
+                        var episodes = await _client.GetSeriesEpisodesAniDbAsync(memberId).ConfigureAwait(false);
+                        foreach (var episode in episodes)
+                        {
+                            if (episode.AniDB?.Type != EpisodeType.Episode)
+                                continue;
+                            if (!eligibleEpisodeIds.Contains(episode.IDs.ID))
+                                continue;
+                            mappings.Add(SyntheticMovieMapping(episode));
+                        }
                     }
                     catch
                     {
@@ -488,24 +497,14 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         }
     }
 
-    /// <summary>Bare-DTO main episode: first unhidden Type==Episode, else first (unhidden) by number.</summary>
-    private static ShokoEpisodeDto? PickMainEpisode(IReadOnlyList<ShokoEpisodeDto> episodes)
-    {
-        if (episodes.Count == 0)
-            return null;
-        var visible = episodes.Where(episode => !episode.IsHidden).ToList();
-        var candidates = visible.Count > 0 ? visible : episodes;
-        return candidates.FirstOrDefault(episode => episode.AniDB?.Type == EpisodeType.Episode)
-            ?? candidates.OrderBy(EpisodeNumberOf).FirstOrDefault();
-    }
-
     private static int EpisodeNumberOf(ShokoEpisodeDto episode) => episode.AniDB?.EpisodeNumber ?? episode.IndexNumber;
 
     /// <summary>
-    /// Synthetic structure-only mapping for a movie series. FileId 0 marks it as a placeholder
-    /// (skipped by path validation and snapshot priming); the non-blank SourcePath only exists
-    /// so the resolver's HasSource yields the episode-id folder — any access to that path
-    /// routes into the lazily materialized subtree, so this path is never actually served.
+    /// Synthetic structure-only mapping for a sourced main episode. FileId 0 marks it as a
+    /// placeholder (skipped by path validation and snapshot priming); the non-blank
+    /// SourcePath only exists so the resolver's HasSource yields the episode-id folder — any
+    /// access to that path routes into the lazily materialized subtree, so this path is
+    /// never actually served.
     /// </summary>
     private EpisodeData SyntheticMovieMapping(ShokoEpisodeDto episode) => new(
         0,
@@ -732,6 +731,42 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                 seeds.Add(id);
         }
         return (fileSeries, seeds);
+    }
+
+    /// <summary>
+    /// Mirror of VfsBuilder eligibility: a file only backs a movie folder when one of its
+    /// locations sits in this managed folder, resolves to a contained path and is not
+    /// excluded. Returns the episode ids xref'd to such files.
+    /// </summary>
+    private HashSet<int> CollectEligibleEpisodeIds(IReadOnlyList<FileDto> files)
+    {
+        var eligible = new HashSet<int>();
+        foreach (var file in files)
+        {
+            bool hasEligibleLocation = false;
+            foreach (var location in file.Locations ?? [])
+            {
+                if (location.ManagedFolderID != _managedFolderId)
+                    continue;
+                if (!TryResolveSource(location.RelativePath, out var resolved))
+                    continue;
+                if (IsPathExcluded(resolved.RelativePath))
+                    continue;
+                hasEligibleLocation = true;
+                break;
+            }
+            if (!hasEligibleLocation)
+                continue;
+
+            foreach (var episodeId in (file.SeriesIDs ?? [])
+                         .SelectMany(group => group.EpisodeIDs, (_, episode) => episode.ID)
+                         .Where(id => id is > 0)
+                         .Select(id => id!.Value))
+            {
+                eligible.Add(episodeId);
+            }
+        }
+        return eligible;
     }
 
     private bool IsEligibleManagedFolder()

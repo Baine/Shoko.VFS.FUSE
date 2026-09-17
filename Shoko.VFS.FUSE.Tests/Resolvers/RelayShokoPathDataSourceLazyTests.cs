@@ -68,6 +68,54 @@ public sealed class RelayShokoPathDataSourceLazyTests
     }
 
     [Fact]
+    public void GetSeriesStructure_ListsEverySourcedMainMovieMapping_MirroringRelayTree()
+    {
+        string root = NewDirectory();
+        try
+        {
+            string firstFile = WriteFile(root, "movie/part1.mkv");
+            string secondFile = WriteFile(root, "movie/part2.mkv");
+            string specialFile = WriteFile(root, "movie/special.mkv");
+            var (movie, _) = MovieSeries(2,
+                (21, 2001, firstFile, "/movie/part1.mkv", EpisodeType.Episode),
+                (22, 2002, secondFile, "/movie/part2.mkv", EpisodeType.Episode),
+                (23, 3001, specialFile, "/movie/special.mkv", EpisodeType.Special));
+            var (tv, _) = TvSeries(1, 11, "/tv/ep1.mkv", "/tv/ep1.mkv");
+            var metadata = new FakeMetadata([tv, movie]);
+            var videoService = VideoService(
+                Place(7, firstFile, "/movie/part1.mkv", series: movie),
+                Place(7, secondFile, "/movie/part2.mkv", series: movie));
+
+            var dataSource = new RelayShokoPathDataSource(
+                metadata.Proxy,
+                new RelayPathDataSourceOptions(7, root),
+                videoService.Proxy);
+
+            var structure = dataSource.GetSeriesStructure();
+
+            var movieEntry = Assert.Single(structure, entry => entry.SeriesId == 2);
+            Assert.True(movieEntry.IsMovie);
+            // Relay's VfsBuilder creates one folder per main (EpisodeType.Episode)
+            // mapping that resolves to a source in the managed folder; the structure
+            // pass must carry every such mapping, not just one per group.
+            Assert.Equal(
+                new[] { 2001, 2002 },
+                movieEntry.Mappings.Select(mapping => mapping.EpisodeId).Order().ToArray());
+            // Non-main (special) mappings never create a movie folder in the relay tree.
+            Assert.DoesNotContain(movieEntry.Mappings, mapping => mapping.EpisodeId == 3001);
+            Assert.All(movieEntry.Mappings, mapping =>
+            {
+                Assert.True(mapping.IsMain);
+                Assert.False(string.IsNullOrWhiteSpace(mapping.SourcePath));
+            });
+        }
+        finally
+        {
+            DeleteDirectory(root);
+        }
+    }
+
+    [Fact]
     public void GetSeriesData_FetchesLazily_Caches_AndInvalidateRefetches()
     {
         string root = NewDirectory();
@@ -285,13 +333,29 @@ public sealed class RelayShokoPathDataSourceLazyTests
         string path,
         string relativePath,
         int managedFolderId = 7) =>
-        SeriesWithFiles(id, id, [Proxy<ITmdbMovie>()], Episode(episodeId, EpisodeType.Episode, 1, 1, Video(videoId, path, relativePath, managedFolderId)));
+        MovieSeries(id, (videoId, episodeId, path, relativePath, EpisodeType.Episode));
+
+    private static (IShokoSeries Series, List<string> Reads) MovieSeries(
+        int id,
+        params (int VideoId, int EpisodeId, string Path, string RelativePath, EpisodeType EpisodeType)[] episodes) =>
+        SeriesWithFiles(
+            id,
+            id,
+            [Proxy<ITmdbMovie>()],
+            episodes
+                .Select(entry => Episode(
+                    entry.EpisodeId,
+                    entry.EpisodeType,
+                    1,
+                    entry.EpisodeType == EpisodeType.Episode ? 1 : 0,
+                    Video(entry.VideoId, entry.Path, entry.RelativePath, 7)))
+                .ToArray());
 
     private static (IShokoSeries Series, List<string> Reads) SeriesWithFiles(
         int id,
         int anidbId,
         IReadOnlyList<ITmdbMovie> tmdbMovies,
-        IShokoEpisode episode)
+        params IShokoEpisode[] episodes)
     {
         var series = Proxy<IShokoSeries>(
             ("get_ID", id),
@@ -302,7 +366,7 @@ public sealed class RelayShokoPathDataSourceLazyTests
             ("get_AirDate", null),
             ("get_TmdbShows", Array.Empty<ITmdbShow>()),
             ("get_TmdbMovies", tmdbMovies),
-            ("get_Episodes", (IReadOnlyList<IShokoEpisode>)[episode])
+            ("get_Episodes", episodes)
         );
         return (series, ((CountingProxy)(object)series).Reads);
     }

@@ -170,16 +170,17 @@ public async Task<IReadOnlyList<FileDto>> GetManagedFolderFilesAsync(int managed
     }
 
     /// <summary>
-    /// <c>GET /api/v3/Series/{seriesId}/Episode</c> — bare episode DTOs (IDs, IndexNumber; the
-    /// AniDB type/number only when the server populates them without includeDataFrom). Much
-    /// cheaper server-side than <see cref="GetSeriesEpisodesAsync"/>; used by the structure
-    /// pass to pick each movie series' main episode id (folder naming only).
+    /// <c>GET /api/v3/Series/{seriesId}/Episode?includeDataFrom=AniDB</c> — every episode with
+    /// its AniDB block (type/number), but without Files, XRefs or TMDB data. Used by the
+    /// structure pass to classify episodes by AniDB type: the bare listing carries no type,
+    /// so main-episode detection needs this middleweight call.
     /// </summary>
-    public async Task<IReadOnlyList<ShokoEpisodeDto>> GetSeriesEpisodesLiteAsync(int seriesId)
+    public async Task<IReadOnlyList<ShokoEpisodeDto>> GetSeriesEpisodesAniDbAsync(int seriesId)
     {
         var result = await GetJsonOrNullAsync<ListResult<ShokoEpisodeDto>>(
             "api/v3/Series/" + seriesId +
-            "/Episode?pageSize=0&includeHidden=true&includeMissing=true&includeUnaired=true");
+            "/Episode?pageSize=0&includeHidden=true&includeMissing=true&includeUnaired=true" +
+            "&includeDataFrom=AniDB");
         return result?.List ?? [];
     }
 

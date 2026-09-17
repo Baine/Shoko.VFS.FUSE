@@ -49,8 +49,8 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
         var structure = ds.GetSeriesStructure();
 
         Assert.Equal(0, handler.FullEpisodeFetches);
-        // One bare (lite) listing for the single movie group; none for the TV series.
-        Assert.Equal(1, handler.LiteEpisodeFetches);
+        // One AniDB-classified listing for the single movie group; none for the TV series.
+        Assert.Equal(1, handler.AniDbEpisodeFetches);
 
         var tv = Assert.Single(structure, s => s.SeriesId == TvSeriesId);
         Assert.False(tv.IsMovie);
@@ -58,10 +58,28 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
 
         var movie = Assert.Single(structure, s => s.SeriesId == MovieSeriesId);
         Assert.True(movie.IsMovie);
+        // Relay-mirror: exactly the file-backed main episodes get a folder. The un-backed
+        // main (22) and the file-backed special (24) must not produce one.
         var placeholder = Assert.Single(movie.Mappings);
         Assert.Equal(0, placeholder.FileId);        // structure-only marker
         Assert.Equal(21, placeholder.EpisodeId);    // main episode → movie folder name
         Assert.True(placeholder.IsMain);
+    }
+
+    [Fact]
+    public void StructurePass_AnchorsEverySourcedMainEpisode_MirroringRelayTree()
+    {
+        var handler = CreateMultiMainFixture(out var client);
+        var ds = CreateDataSource(client);
+
+        var structure = ds.GetSeriesStructure();
+
+        var movie = Assert.Single(structure, s => s.SeriesId == MovieSeriesId);
+        Assert.True(movie.IsMovie);
+        Assert.Equal(
+            new[] { 21, 22 },
+            movie.Mappings.Select(m => m.EpisodeId).Order().ToArray());
+        Assert.All(movie.Mappings, m => Assert.Equal(0, m.FileId));
     }
 
     [Fact]
@@ -149,7 +167,16 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
             MergeTmdbSeries = false,
         }, cacheTtl: TimeSpan.FromMinutes(5), maxDegree: 2, snapshotStore: store, snapshotKey: key);
 
-    private FakeShokoHandler CreateFixture(out ShokoRestClient client)
+    private FakeShokoHandler CreateFixture(out ShokoRestClient client) =>
+        CreateFixtureCore(out client, addSpecial: true);
+
+    private FakeShokoHandler CreateMultiMainFixture(out ShokoRestClient client)
+    {
+        var handler = CreateFixtureCore(out client, addSpecial: true, secondMain: true);
+        return handler;
+    }
+
+    private FakeShokoHandler CreateFixtureCore(out ShokoRestClient client, bool addSpecial, bool secondMain = false)
     {
         var tvFile = new FileDto
         {
@@ -173,6 +200,36 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
                 EpisodeIDs = [new FileEpisodeIdsDto { ID = 21 }],
             }],
         };
+        var files = new List<FileDto> { tvFile, movieFile };
+        if (addSpecial)
+        {
+            files.Add(new FileDto
+            {
+                ID = 14,
+                Size = 1,
+                Locations = [new FileLocationDto { ManagedFolderID = ManagedFolderId, RelativePath = "Film/special.mkv" }],
+                SeriesIDs = [new FileCrossRefGroupDto
+                {
+                    SeriesID = new FileSeriesIdsDto { ID = MovieSeriesId },
+                    EpisodeIDs = [new FileEpisodeIdsDto { ID = 24 }],
+                }],
+            });
+        }
+        if (secondMain)
+        {
+            files.Add(new FileDto
+            {
+                ID = 16,
+                Size = 1,
+                Locations = [new FileLocationDto { ManagedFolderID = ManagedFolderId, RelativePath = "Film/movie2.mkv" }],
+                SeriesIDs = [new FileCrossRefGroupDto
+                {
+                    SeriesID = new FileSeriesIdsDto { ID = MovieSeriesId },
+                    EpisodeIDs = [new FileEpisodeIdsDto { ID = 22 }],
+                }],
+            });
+        }
+
         var tvSeries = new ShokoSeriesDto
         {
             IDs = new SeriesIdsDto { ID = TvSeriesId },
@@ -185,40 +242,46 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
             Name = "Film",
             AniDB = new AnidbAnimeDto { ID = 1009, Type = AnimeType.Movie },
         };
+
+        var tvEpisodes = new List<ShokoEpisodeDto> { Episode(1, TvSeriesId, 1007, EpisodeType.Episode, tvFile) };
+        // Main episode backed by a file (folder anchor), plus edge cases:
+        // 22 = main episode without any file in the folder → no folder (relay parity),
+        // 24 = file-backed special → no folder (relay parity).
+        // secondMain makes 22 file-backed → folder (multi-movie mirror parity).
+        var movieEpisodes = new List<ShokoEpisodeDto>
+        {
+            Episode(21, MovieSeriesId, 1009, EpisodeType.Episode, movieFile),
+            Episode(22, MovieSeriesId, 1009, EpisodeType.Episode, secondMain ? files[3] : null),
+        };
+        if (addSpecial)
+            movieEpisodes.Add(Episode(24, MovieSeriesId, 1009, EpisodeType.Special, files[2]));
+
         var handler = new FakeShokoHandler(
             folders: [new ManagedFolderDto { ID = ManagedFolderId, Name = "Import", Path = _root, DropFolderType = DropFolderType.Both }],
-            files: [tvFile, movieFile],
+            files: files,
             series: [tvSeries, movieSeries],
             fullEpisodes: new()
             {
-                [TvSeriesId] = [FullEpisode(1, TvSeriesId, 1007, tvFile)],
-                [MovieSeriesId] = [FullEpisode(21, MovieSeriesId, 1009, movieFile)],
+                [TvSeriesId] = tvEpisodes,
+                [MovieSeriesId] = movieEpisodes,
             },
-            liteEpisodes: new()
+            aniDbEpisodes: new()
             {
-                [TvSeriesId] = [LiteEpisode(1, TvSeriesId)],
-                [MovieSeriesId] = [LiteEpisode(21, MovieSeriesId)],
+                [TvSeriesId] = tvEpisodes,
+                [MovieSeriesId] = movieEpisodes,
             });
         var http = new HttpClient(handler) { BaseAddress = new Uri("http://test/") };
         client = new ShokoRestClient(http, "http://test/");
         return handler;
     }
 
-    private static ShokoEpisodeDto FullEpisode(int episodeId, int seriesId, int anidbAnimeId, FileDto file) => new()
+    private static ShokoEpisodeDto Episode(int episodeId, int seriesId, int anidbAnimeId, EpisodeType type, FileDto? file) => new()
     {
         IDs = new EpisodeIdsDto { ID = episodeId, ParentSeries = seriesId },
         Name = $"Episode {episodeId}",
         IsHidden = false,
-        AniDB = new AnidbEpisodeDto { ID = episodeId, AnimeID = anidbAnimeId, Type = EpisodeType.Episode, EpisodeNumber = 1 },
-        Files = [file],
-    };
-
-    // The lite endpoint carries no includeDataFrom blocks on the real server: bare IDs + number.
-    private static ShokoEpisodeDto LiteEpisode(int episodeId, int seriesId) => new()
-    {
-        IDs = new EpisodeIdsDto { ID = episodeId, ParentSeries = seriesId },
-        IndexNumber = 1,
-        IsHidden = false,
+        AniDB = new AnidbEpisodeDto { ID = episodeId, AnimeID = anidbAnimeId, Type = type, EpisodeNumber = 1 },
+        Files = file is null ? [] : [file],
     };
 
     private sealed class FakeShokoHandler : HttpMessageHandler
@@ -228,7 +291,7 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
         private readonly string _seriesJson;
         private readonly Dictionary<int, string> _singleSeriesJson;
         private readonly Dictionary<int, string> _fullEpisodesJson;
-        private readonly Dictionary<int, string> _liteEpisodesJson;
+        private readonly Dictionary<int, string> _aniDbEpisodesJson;
         private readonly ConcurrentQueue<string> _requests = new();
 
         public FakeShokoHandler(
@@ -236,7 +299,7 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
             IReadOnlyList<FileDto> files,
             IReadOnlyList<ShokoSeriesDto> series,
             Dictionary<int, IReadOnlyList<ShokoEpisodeDto>> fullEpisodes,
-            Dictionary<int, IReadOnlyList<ShokoEpisodeDto>> liteEpisodes)
+            Dictionary<int, IReadOnlyList<ShokoEpisodeDto>> aniDbEpisodes)
         {
             _foldersJson = Serialize(folders);
             _filesJson = Serialize(new ListResult<FileDto> { Total = files.Count, List = files });
@@ -245,25 +308,26 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
             _fullEpisodesJson = fullEpisodes.ToDictionary(
                 pair => pair.Key,
                 pair => Serialize(new ListResult<ShokoEpisodeDto> { Total = pair.Value.Count, List = pair.Value }));
-            _liteEpisodesJson = liteEpisodes.ToDictionary(
+            _aniDbEpisodesJson = aniDbEpisodes.ToDictionary(
                 pair => pair.Key,
                 pair => Serialize(new ListResult<ShokoEpisodeDto>
                 {
                     Total = pair.Value.Count,
-                    // Simulate the real server: no AniDB/TMDB/Files without includeDataFrom.
+                    // Simulate the AniDB-only server response: type/number, no Files/XRefs/TMDB.
                     List = pair.Value.Select(e => new ShokoEpisodeDto
                     {
                         IDs = e.IDs,
                         Name = e.Name,
                         IndexNumber = e.IndexNumber,
                         IsHidden = e.IsHidden,
+                        AniDB = e.AniDB,
                     }).ToList(),
                 }));
         }
 
-        public int FullEpisodeFetches => _requests.Count(r => r.Contains("/Episode") && r.Contains("includeDataFrom"));
+        public int FullEpisodeFetches => _requests.Count(r => r.Contains("/Episode") && r.Contains("includeFiles"));
 
-        public int LiteEpisodeFetches => _requests.Count(r => r.Contains("/Episode") && !r.Contains("includeDataFrom"));
+        public int AniDbEpisodeFetches => _requests.Count(r => r.Contains("/Episode") && r.Contains("includeDataFrom=AniDB") && !r.Contains("includeFiles"));
 
         private static string Serialize(object value) => JsonConvert.SerializeObject(value);
 
@@ -281,9 +345,9 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
             else if (Regex.IsMatch(path, @"/api/v3/Series/\d+/Episode$"))
             {
                 int id = int.Parse(Regex.Match(path, @"/api/v3/Series/(\d+)/").Groups[1].Value);
-                body = query.Contains("includeDataFrom")
+                body = query.Contains("includeFiles")
                     ? _fullEpisodesJson.GetValueOrDefault(id)
-                    : _liteEpisodesJson.GetValueOrDefault(id);
+                    : _aniDbEpisodesJson.GetValueOrDefault(id);
             }
             else if (Regex.IsMatch(path, @"/api/v3/Series/\d+$"))
             {
