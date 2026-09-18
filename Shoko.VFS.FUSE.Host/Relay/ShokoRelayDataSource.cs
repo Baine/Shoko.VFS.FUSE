@@ -615,7 +615,8 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         1,
         false,
         true,
-        episode.Name,
+        // Preferred-title baseline, same semantics as ResolveEpisodeTitle (Name = default title).
+        episode.AniDB is { Title.Length: > 0 } anidbTitle ? anidbTitle.Title : episode.Name,
         _managedFolderRoot,
         0,
         "");
@@ -661,11 +662,15 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                 continue;
 
             var episodeVideos = new List<RelayRawVideo>();
+            var episodeType = anidbEpisode.Type;
             foreach (var file in episode.Files ?? [])
             {
                 if (!videos.TryGetValue(file.ID, out var rawVideo))
                 {
-                    rawVideo = ExtractVideo(file, folders);
+                    // Main/extra is decided by the episode first processed for this file id
+                    // (the series-level cache shares one extraction across xrefs, mirroring
+                    // the projector's single primary-driven mapping per video).
+                    rawVideo = ExtractVideo(file, folders, episodeType == EpisodeType.Episode);
                     videos.Add(file.ID, rawVideo);
                 }
                 // Upstream keeps location-excluded videos in the mapping inputs — they
@@ -675,7 +680,6 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
                 episodeVideos.Add(rawVideo);
             }
 
-            var episodeType = anidbEpisode.Type;
             var rawEpisode = new RelayRawEpisode(
                 episode.IDs.ID,
                 episodeType,
@@ -719,9 +723,13 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
 
     private string ResolveEpisodeTitle(ShokoEpisodeDto episode, ShokoSeriesDto series, string displaySeriesTitle)
     {
-        // Baseline title: the Episode DTO's Name (= server's override ?? preferred ?? default),
-        // matching the plugin's IWithTitles.PreferredTitle baseline.
-        string raw = GetTitleByLanguage(episode.Name ?? "", episode.AniDB?.Titles, _options.EpisodeTitleLanguage);
+        // Baseline title: the AniDB preferred title (live API: DTO Name = DEFAULT title,
+        // AniDB.Title = override ?? preferred ?? default), matching the plugin's
+        // IWithTitles.PreferredTitle baseline; Name only as a fallback without AniDB data.
+        string raw = GetTitleByLanguage(
+            episode.AniDB is { Title.Length: > 0 } anidbTitle ? anidbTitle.Title : episode.Name ?? "",
+            episode.AniDB?.Titles,
+            _options.EpisodeTitleLanguage);
         string? tmdbTitle = episode.TMDB?.Episodes.FirstOrDefault()?.Title;
 
         if (episode.AniDB?.EpisodeNumber == 1 && s_ambiguousTitles.Contains(raw))
@@ -1053,19 +1061,26 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         tmdb.Title
     );
 
-    private RelayRawVideo ExtractVideo(FileDto file, IReadOnlyDictionary<int, ManagedFolderDto> folders)
+    private RelayRawVideo ExtractVideo(FileDto file, IReadOnlyDictionary<int, ManagedFolderDto> folders, bool isMainEpisode)
     {
         var locations = file.Locations;
-                var selected = SelectSource(locations, file.Size, folders, out bool excluded);
-                var source = selected?.ManagedFolderId == _managedFolderId ? selected : null;
-                // Upstream sorts part/dup candidates by the FIRST physical location's
-                // basename, regardless of eligibility (MapHelper.cs:167-170).
-                var sortPath = NormalizeForSort(locations.FirstOrDefault()?.RelativePath);
+        var selected = SelectSource(locations, file.Size, folders, out bool excluded);
+        var source = selected?.ManagedFolderId == _managedFolderId ? selected : null;
+        // Extras resolve across all eligible managed folders (upstream links them from any
+        // import root); main files keep the strict mounted-folder gate above.
+        if (source is null && !isMainEpisode && !excluded)
+        {
+            source = SelectCrossFolderSource(locations, file.Size, folders, out bool fallbackExcluded);
+            excluded |= fallbackExcluded;
+        }
+        // Upstream sorts part/dup candidates by the FIRST physical location's
+        // basename, regardless of eligibility (MapHelper.cs:167-170).
+        var sortPath = NormalizeForSort(locations.FirstOrDefault()?.RelativePath);
         var crossReferences = (file.SeriesIDs ?? [])
             .SelectMany(group => group.EpisodeIDs, (group, episode) => new RelayRawCrossReference(episode.ID, group.SeriesID.ID))
             .ToArray();
 
-        return new RelayRawVideo(file.ID, file.IsVariation, sortPath, source?.AbsolutePath, selected?.Size ?? 0, selected?.Extension ?? "", crossReferences)
+        return new RelayRawVideo(file.ID, file.IsVariation, sortPath, source?.AbsolutePath, source?.Size ?? selected?.Size ?? 0, source?.Extension ?? selected?.Extension ?? "", crossReferences)
         {
             IsExcluded = excluded,
         };
@@ -1098,6 +1113,58 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         return null;
     }
 
+    /// <summary>
+    /// Extras-only fallback: resolve each location against ITS OWN managed folder's root so a
+    /// file indexed in a different eligible folder than the mounted one still links (upstream
+    /// resolves extra sources across all import roots). Mounted folder is preferred first to
+    /// keep the current resolution when it works; eligibility and path exclusions still apply.
+    /// </summary>
+    private SelectedSource? SelectCrossFolderSource(List<FileLocationDto> locations, long fileSize, IReadOnlyDictionary<int, ManagedFolderDto> folders, out bool excluded)
+    {
+        excluded = false;
+        foreach (var location in locations.OrderBy(location => location.ManagedFolderID == _managedFolderId ? 0 : 1))
+        {
+            if (!IsFolderEligible(location, folders)
+                || !folders.TryGetValue(location.ManagedFolderID, out var folder))
+                continue;
+            string root = location.ManagedFolderID == _managedFolderId ? _managedFolderRoot : TranslateServerPath(folder.Path);
+            if (string.IsNullOrWhiteSpace(root))
+                continue;
+            if (!TryResolveSource(location.RelativePath, root, out var resolved))
+                continue;
+            if (IsPathExcluded(resolved.RelativePath, resolved.AbsolutePath))
+            {
+                excluded = true;
+                return null;
+            }
+
+            return new SelectedSource(
+                resolved.AbsolutePath,
+                resolved.RelativePath,
+                location.ManagedFolderID,
+                fileSize,
+                resolved.Extension
+            );
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Prefix-swaps a SERVER-side managed-folder root to a host path
+    /// (<c>ServerPathRoot → ManagedFolderPathRoot</c>, identity when unset). Mirrors
+    /// <c>DaemonOrchestrator.MapPath</c>, which only translates the mounted root before
+    /// the data source sees the raw REST managed-folder listing.
+    /// </summary>
+    private string TranslateServerPath(string serverPath)
+    {
+        string from = _options.ServerPathRoot.TrimEnd('/');
+        string to = _options.ManagedFolderPathRoot.TrimEnd('/');
+        if (from.Length == 0 || to.Length == 0 || !serverPath.StartsWith(from, StringComparison.Ordinal))
+            return serverPath;
+        return to + serverPath[from.Length..];
+    }
+
     private bool IsFolderEligible(FileLocationDto location, IReadOnlyDictionary<int, ManagedFolderDto> folders)
     {
         if (!folders.TryGetValue(location.ManagedFolderID, out var folder))
@@ -1116,7 +1183,10 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         return true;
     }
 
-    private bool TryResolveSource(string relativePath, out ResolvedSource source)
+    private bool TryResolveSource(string relativePath, out ResolvedSource source) =>
+        TryResolveSource(relativePath, _managedFolderRoot, out source);
+
+    private bool TryResolveSource(string relativePath, string root, out ResolvedSource source)
     {
         source = default!;
         string relative = NormalizeSeparators(relativePath ?? "");
@@ -1133,8 +1203,9 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
 
         try
         {
-            string candidate = Path.GetFullPath(Path.Combine(_managedFolderRoot, relative));
-            if (!IsContained(candidate))
+            string normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+            string candidate = Path.GetFullPath(Path.Combine(normalizedRoot, relative));
+            if (!IsContained(candidate, normalizedRoot))
                 return false;
             // Upstream ResolveSourcePath only resolves files that physically exist
             // (VfsShared.cs:74-88); a stale DB row must not produce a VFS entry.
@@ -1151,9 +1222,9 @@ public sealed class ShokoRelayDataSource : IShokoPathDataSource, ILazyShokoPathD
         return false;
     }
 
-    private bool IsContained(string candidate)
+    private bool IsContained(string candidate, string root)
     {
-        string relative = Path.GetRelativePath(_managedFolderRoot, candidate);
+        string relative = Path.GetRelativePath(root, candidate);
         return !Path.IsPathRooted(relative)
             && !string.Equals(relative, "..", _pathComparison)
             && !relative.StartsWith(".." + Path.DirectorySeparatorChar, _pathComparison)

@@ -32,6 +32,8 @@ public static class DaemonMounter
         var relayOptions = new RelayPathDataSourceOptions(target.ManagedFolderId, target.ManagedFolderPath)
         {
             ManagedFolderName = target.ManagedFolderName,
+            ServerPathRoot = config.ServerPathRoot ?? "",
+            ManagedFolderPathRoot = config.ManagedFolderPathRoot ?? "",
             ManagedFolderType = Shoko.Abstractions.Video.Enums.DropFolderType.Excluded,
             TmdbEpNumbering = config.TmdbEpNumbering,
             MergeTmdbSeries = config.MergeTmdbSeries,

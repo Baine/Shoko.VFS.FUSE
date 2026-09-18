@@ -14,6 +14,16 @@ namespace Shoko.VFS.FUSE.Resolvers.Relay;
 public sealed record RelayPathDataSourceOptions(int ManagedFolderId, string ManagedFolderRoot)
 {
     public string ManagedFolderName { get; init; } = "";
+
+    /// <summary>
+    /// Server→host path prefix mapping (Host daemon only): the REST managed-folder listing
+    /// carries SERVER-side roots while only the mounted root is translated at startup, so the
+    /// cross-folder fallback re-maps foreign roots with this pair — the exact
+    /// <c>ServerPathRoot → ManagedFolderPathRoot</c> prefix swap of <c>DaemonOrchestrator.MapPath</c>.
+    /// Empty (the in-process plugin default) means identity.
+    /// </summary>
+    public string ServerPathRoot { get; init; } = "";
+    public string ManagedFolderPathRoot { get; init; } = "";
     public DropFolderType ManagedFolderType { get; init; } = DropFolderType.Excluded;
     public bool TmdbEpNumbering { get; init; } = true;
     public bool MergeTmdbSeries { get; init; }
@@ -477,7 +487,10 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
             {
                 if (!videos.TryGetValue(video.ID, out var rawVideo))
                 {
-                    rawVideo = ExtractVideo(video);
+                    // Main/extra is decided by the episode first processed for this video id
+                    // (the series-level cache shares one extraction across xrefs, mirroring
+                    // the projector's single primary-driven mapping per video).
+                    rawVideo = ExtractVideo(video, episode.Type == EpisodeType.Episode);
                     videos.Add(video.ID, rawVideo);
                 }
                 // Upstream keeps location-excluded videos in the mapping inputs — they count
@@ -537,11 +550,18 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
         };
     }
 
-    private RelayRawVideo ExtractVideo(IVideo video)
+    private RelayRawVideo ExtractVideo(IVideo video, bool isMainEpisode)
     {
         var locations = video.Files ?? Array.Empty<IVideoFile>();
         var selected = SelectSource(locations, out bool excluded);
         var source = selected?.ManagedFolderId == _managedFolderId ? selected : null;
+        // Extras resolve across all eligible managed folders (upstream links them from any
+        // import root); main files keep the strict mounted-folder gate above.
+        if (source is null && !isMainEpisode && !excluded)
+        {
+            source = SelectCrossFolderSource(locations, out bool fallbackExcluded);
+            excluded |= fallbackExcluded;
+        }
         // Upstream sorts part/dup candidates by the FIRST physical location's basename,
         // regardless of eligibility (MapHelper.cs:167-170).
         var sortPath = NormalizeForSort(locations.FirstOrDefault()?.RelativePath);
@@ -549,7 +569,7 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
             .Select(reference => new RelayRawCrossReference(reference.ShokoEpisode?.ID, reference.ShokoEpisode?.SeriesID))
             .ToArray();
 
-        return new RelayRawVideo(video.ID, video.IsVariation, sortPath, source?.AbsolutePath, selected?.Size ?? 0, selected?.Extension ?? "", crossReferences)
+        return new RelayRawVideo(video.ID, video.IsVariation, sortPath, source?.AbsolutePath, source?.Size ?? selected?.Size ?? 0, source?.Extension ?? selected?.Extension ?? "", crossReferences)
         {
             IsExcluded = excluded,
         };
@@ -582,6 +602,59 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
         return null;
     }
 
+    /// <summary>
+    /// Extras-only fallback: resolve each location against ITS OWN managed folder's root so a
+    /// file indexed in a different eligible folder than the mounted one still links (upstream
+    /// resolves extra sources across all import roots). Mounted folder is preferred first to
+    /// keep the current resolution when it works; eligibility and path exclusions still apply.
+    /// </summary>
+    private SelectedSource? SelectCrossFolderSource(IEnumerable<IVideoFile> locations, out bool excluded)
+    {
+        excluded = false;
+        foreach (var location in locations.OrderBy(location => location.ManagedFolderID == _managedFolderId ? 0 : 1))
+        {
+            if (!IsFolderEligible(location))
+                continue;
+            string root = location.ManagedFolderID == _managedFolderId
+                ? _managedFolderRoot
+                : TranslateServerPath(location.ManagedFolder?.Path ?? "");
+            if (string.IsNullOrWhiteSpace(root))
+                continue;
+            if (!TryResolveSource(location, root, out var resolved))
+                continue;
+            if (IsPathExcluded(resolved.RelativePath, resolved.AbsolutePath))
+            {
+                excluded = true;
+                return null;
+            }
+
+            return new SelectedSource(
+                resolved.AbsolutePath,
+                resolved.RelativePath,
+                location.ManagedFolderID,
+                location.Size,
+                resolved.Extension
+            );
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Prefix-swaps a SERVER-side managed-folder root to a host path
+    /// (<c>ServerPathRoot → ManagedFolderPathRoot</c>, identity when unset — the in-process
+    /// plugin case). Mirrors <c>DaemonOrchestrator.MapPath</c>, which only ever sees the
+    /// mounted root before it reaches the data source.
+    /// </summary>
+    private string TranslateServerPath(string serverPath)
+    {
+        string from = _options.ServerPathRoot.TrimEnd('/');
+        string to = _options.ManagedFolderPathRoot.TrimEnd('/');
+        if (from.Length == 0 || to.Length == 0 || !serverPath.StartsWith(from, StringComparison.Ordinal))
+            return serverPath;
+        return to + serverPath[from.Length..];
+    }
+
     private bool IsFolderEligible(IVideoFile location)
     {
         var folder = location.ManagedFolder;
@@ -601,7 +674,10 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
         return true;
     }
 
-    private bool TryResolveSource(IVideoFile location, out ResolvedSource source)
+    private bool TryResolveSource(IVideoFile location, out ResolvedSource source) =>
+        TryResolveSource(location, _managedFolderRoot, out source);
+
+    private bool TryResolveSource(IVideoFile location, string root, out ResolvedSource source)
     {
         source = default!;
         string relative = NormalizeSeparators(location.RelativePath ?? "");
@@ -618,8 +694,9 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
 
         try
         {
-            string candidate = Path.GetFullPath(Path.Combine(_managedFolderRoot, relative));
-            if (!IsContained(candidate))
+            string normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+            string candidate = Path.GetFullPath(Path.Combine(normalizedRoot, relative));
+            if (!IsContained(candidate, normalizedRoot))
                 return false;
             // Upstream ResolveSourcePath only resolves files that physically exist
             // (VfsShared.cs:74-88); a stale DB row must not produce a VFS entry.
@@ -636,9 +713,9 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
         return false;
     }
 
-    private bool IsContained(string candidate)
+    private bool IsContained(string candidate, string root)
     {
-        string relative = Path.GetRelativePath(_managedFolderRoot, candidate);
+        string relative = Path.GetRelativePath(root, candidate);
         return !Path.IsPathRooted(relative)
             && !string.Equals(relative, "..", _pathComparison)
             && !relative.StartsWith(".." + Path.DirectorySeparatorChar, _pathComparison)

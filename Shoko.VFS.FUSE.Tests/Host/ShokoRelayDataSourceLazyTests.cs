@@ -250,6 +250,103 @@ public sealed class ShokoRelayDataSourceLazyTests : IDisposable
     }
 
     [Fact]
+    public void PerSeriesData_EpisodeTitlePrefersAniDbPreferredTitleOverDefaultName()
+    {
+        // Live API: the episode DTO's Name is the DEFAULT title; the preferred title
+        // (override ?? preferred ?? default, = plugin's PreferredTitle) is AniDB.Title.
+        var file = new FileDto
+        {
+            ID = 40,
+            Size = 1,
+            Locations = [new FileLocationDto { ManagedFolderID = ManagedFolderId, RelativePath = "Show/ep1.mkv" }],
+            SeriesIDs = [new FileCrossRefGroupDto
+            {
+                SeriesID = new FileSeriesIdsDto { ID = TvSeriesId },
+                EpisodeIDs = [new FileEpisodeIdsDto { ID = 1 }],
+            }],
+        };
+        var episode = Episode(1, TvSeriesId, 1007, EpisodeType.Episode, file);
+        episode.Name = "Digimon Adventure";
+        episode.AniDB!.Title = "US Chopjob";
+        var tvSeries = new ShokoSeriesDto
+        {
+            IDs = new SeriesIdsDto { ID = TvSeriesId },
+            Name = "Show",
+            AniDB = new AnidbAnimeDto { ID = 1007, Type = AnimeType.TV },
+        };
+        var handler = new FakeShokoHandler(
+            folders: [new ManagedFolderDto { ID = ManagedFolderId, Name = "Import", Path = _root, DropFolderType = DropFolderType.Both }],
+            files: [file],
+            series: [tvSeries],
+            fullEpisodes: new() { [TvSeriesId] = [episode] },
+            aniDbEpisodes: new() { [TvSeriesId] = [episode] });
+        var http = new HttpClient(handler) { BaseAddress = new Uri("http://test/") };
+        var client = new ShokoRestClient(http, "http://test/");
+        var ds = new ShokoRelayDataSource(client, new RelayPathDataSourceOptions(ManagedFolderId, _root)
+        {
+            ManagedFolderName = "Import",
+            ManagedFolderType = Shoko.Abstractions.Video.Enums.DropFolderType.Destination,
+        }, cacheTtl: TimeSpan.FromMinutes(5), maxDegree: 2);
+
+        var data = ds.GetSeriesData(TvSeriesId);
+
+        var mapping = Assert.Single(data!.Mappings);
+        Assert.Equal("US Chopjob", mapping.EpisodeTitle);
+    }
+
+    [Fact]
+    public void PerSeriesData_ExtraInForeignManagedFolder_ResolvesServerTranslatedRoot()
+    {
+        // Live parity case: the extra's ONLY location is in another managed folder whose
+        // REST root is SERVER-side (untranslated); the fallback must apply the
+        // ServerPathRoot→ManagedFolderPathRoot prefix swap before the file-exists check.
+        Directory.CreateDirectory(Path.Combine(_root, "host", "GerSub"));
+        File.WriteAllText(Path.Combine(_root, "host", "GerSub", "extra.mkv"), "e");
+        var file = new FileDto
+        {
+            ID = 60,
+            Size = 1,
+            Locations = [new FileLocationDto { ManagedFolderID = 2, RelativePath = "/extra.mkv" }],
+            SeriesIDs = [new FileCrossRefGroupDto
+            {
+                SeriesID = new FileSeriesIdsDto { ID = TvSeriesId },
+                EpisodeIDs = [new FileEpisodeIdsDto { ID = 2 }],
+            }],
+        };
+        var special = Episode(2, TvSeriesId, 1007, EpisodeType.Special, file);
+        var tvSeries = new ShokoSeriesDto
+        {
+            IDs = new SeriesIdsDto { ID = TvSeriesId },
+            Name = "Show",
+            AniDB = new AnidbAnimeDto { ID = 1007, Type = AnimeType.TV },
+        };
+        var handler = new FakeShokoHandler(
+            folders:
+            [
+                new ManagedFolderDto { ID = ManagedFolderId, Name = "Import", Path = _root, DropFolderType = DropFolderType.Both },
+                new ManagedFolderDto { ID = 2, Name = "GerSub", Path = Path.Combine(_root, "srv", "GerSub"), DropFolderType = DropFolderType.Both },
+            ],
+            files: [file],
+            series: [tvSeries],
+            fullEpisodes: new() { [TvSeriesId] = [special] },
+            aniDbEpisodes: new() { [TvSeriesId] = [special] });
+        var http = new HttpClient(handler) { BaseAddress = new Uri("http://test/") };
+        var client = new ShokoRestClient(http, "http://test/");
+        var ds = new ShokoRelayDataSource(client, new RelayPathDataSourceOptions(ManagedFolderId, _root)
+        {
+            ManagedFolderName = "Import",
+            ManagedFolderType = Shoko.Abstractions.Video.Enums.DropFolderType.Destination,
+            ServerPathRoot = Path.Combine(_root, "srv"),
+            ManagedFolderPathRoot = Path.Combine(_root, "host"),
+        }, cacheTtl: TimeSpan.FromMinutes(5), maxDegree: 2);
+
+        var data = ds.GetSeriesData(TvSeriesId);
+
+        var mapping = Assert.Single(data!.Mappings);
+        Assert.Equal(Path.Combine(_root, "host", "GerSub", "extra.mkv"), mapping.SourcePath);
+    }
+
+    [Fact]
     public void PerSeriesData_FetchedLazily_Cached_AndInvalidatedById()
     {
         var handler = CreateFixture(out var client);
