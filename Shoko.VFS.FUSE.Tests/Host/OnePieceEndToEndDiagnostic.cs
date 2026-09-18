@@ -6,6 +6,8 @@ using Shoko.VFS.FUSE.Naming;
 using Shoko.VFS.FUSE.Resolvers;
 using Shoko.VFS.FUSE.Resolvers.Relay;
 
+using Shoko.VFS.FUSE.Tests.Support;
+
 namespace Shoko.VFS.FUSE.Tests.Host;
 
 /// <summary>
@@ -137,10 +139,11 @@ public sealed class OnePieceEndToEndDiagnostic
     }
 
     [Fact]
-    public void RunOnePieceEndToEndDiagnostic()
+    public async Task RunOnePieceEndToEndDiagnostic()
     {
         var dataDir = Environment.GetEnvironmentVariable("ONE_PIECE_TEST_DATA")
             ?? "/tmp/opencode/onepiece_test_data";
+        await OnePieceFixture.EnsureRecordedAsync(dataDir, Path.Combine(dataDir, "op_eps.json")).ConfigureAwait(false);
         Assert.True(Directory.Exists(dataDir), $"Test data not found at {dataDir}");
 
         var handler = new MockHttpHandler(dataDir);
@@ -217,10 +220,11 @@ public sealed class OnePieceEndToEndDiagnostic
     }
 
     [Fact]
-    public void RunOnePieceResolverDiagnostic()
+    public async Task RunOnePieceResolverDiagnostic()
     {
         var dataDir = Environment.GetEnvironmentVariable("ONE_PIECE_TEST_DATA")
             ?? "/tmp/opencode/onepiece_test_data";
+        await OnePieceFixture.EnsureRecordedAsync(dataDir, Path.Combine(dataDir, "op_eps.json")).ConfigureAwait(false);
         Assert.True(Directory.Exists(dataDir), $"Test data not found at {dataDir}");
 
         // Find GerDub ID from managed_folders.json

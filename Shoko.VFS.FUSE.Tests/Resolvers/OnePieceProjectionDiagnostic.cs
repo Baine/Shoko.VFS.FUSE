@@ -2,6 +2,7 @@ using System.Text.Json;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.VFS.FUSE.Resolvers;
 using Shoko.VFS.FUSE.Resolvers.Relay;
+using Shoko.VFS.FUSE.Tests.Support;
 
 namespace Shoko.VFS.FUSE.Tests.Resolvers;
 
@@ -61,9 +62,11 @@ public sealed class OnePieceProjectionDiagnostic
     }
 
     [Fact]
-    public void RunOnePieceDiagnostic()
+    public async Task RunOnePieceDiagnostic()
     {
         var path = Environment.GetEnvironmentVariable("ONE_PIECE_JSON") ?? "/tmp/opencode/onepiece/op_eps.json";
+        var dataDir = Environment.GetEnvironmentVariable("ONE_PIECE_TEST_DATA") ?? "/tmp/opencode/onepiece_test_data";
+        await OnePieceFixture.EnsureRecordedAsync(dataDir, path).ConfigureAwait(false);
         Assert.True(File.Exists(path), $"One Piece JSON not found at {path}");
 
         var json = File.ReadAllText(path);

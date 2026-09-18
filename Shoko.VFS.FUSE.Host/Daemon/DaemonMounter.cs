@@ -62,6 +62,21 @@ public static class DaemonMounter
             snapshotKey: snapshotKey);
     }
 
+    private static void TryCreateIgnoreMarker(string mountPoint, ILogger logger)
+    {
+        try
+        {
+            Directory.CreateDirectory(mountPoint);
+            var marker = Path.Combine(mountPoint, ".ignore");
+            if (!File.Exists(marker))
+                File.Create(marker).Dispose();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not create .ignore marker for {Path}; continuing.", mountPoint);
+        }
+    }
+
     /// <summary>
     /// Creates and starts a lease for the given <c>RelayMountTarget</c>.
     /// Returns a <c>DaemonLease</c> on success, throws <c>FuseStartException</c> on failure.
@@ -81,6 +96,13 @@ public static class DaemonMounter
         FileSnapshotStore? snapshotStore = null)
     {
         var logger = loggerFactory.CreateLogger("Shoko.VFS.FUSE.Host.Daemon.DaemonMounter");
+
+        // 0. Optional .ignore marker: an empty file in each VFS root directory on
+        // the underlying filesystem tells bypassing scanners (rsync, restic, the
+        // Unraid mover, ...) to skip the relay roots. Must happen before the mount
+        // takes over the path; the mounter accepts .ignore-only mount points.
+        if (config.CreateIgnoreFiles)
+            TryCreateIgnoreMarker(target.TargetPath, logger);
 
         // 1. Build the Relay path data source (reads data from the server via REST).
         var dataSource = CreateDataSource(target, config, client, snapshotStore);

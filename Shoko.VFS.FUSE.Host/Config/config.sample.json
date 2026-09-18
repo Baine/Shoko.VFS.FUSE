@@ -35,6 +35,10 @@
   "AttrTimeout": 2.0,
   "EntryTimeout": 2.0,
   "NegativeTimeout": 0.5,
+  // When true, the daemon writes an empty .ignore marker file into each VFS
+  // root directory on the underlying disk so bypassing scanners (rsync,
+  // restic, the Unraid mover, ...) skip the relay roots.
+  "CreateIgnoreFiles": false,
 
   // -- Host path mapping (Unraid example) --
   // Maps server-side /mnt/array/* to Unraid's /mnt/user/array/* so

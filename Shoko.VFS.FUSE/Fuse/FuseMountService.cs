@@ -214,7 +214,7 @@ public sealed class FuseMountService : IDisposable
             var targetState = await RunFilesystemProbeAsync(() => DirectoryExists(_options.MountPoint), ct).ConfigureAwait(false);
             var fileState = await RunFilesystemProbeAsync(() => FileExists(_options.MountPoint), ct).ConfigureAwait(false);
             var emptyState = targetState == FilesystemProbeState.True && !targetIsMounted
-                ? await RunFilesystemProbeAsync(() => IsDirectoryEmpty(_options.MountPoint), ct).ConfigureAwait(false)
+                ? await RunFilesystemProbeAsync(() => IsDirectoryMountable(_options.MountPoint), ct).ConfigureAwait(false)
                 : FilesystemProbeState.False;
 
             if (parentState == FilesystemProbeState.Failed
@@ -266,7 +266,7 @@ public sealed class FuseMountService : IDisposable
         }
         else if (decision.AcceptEmpty)
         {
-            // Existing empty directory is acceptable; continue.
+            // Existing empty (or .ignore-only) directory is acceptable; continue.
         }
 
         // 4. Host prerequisite probes (non-destructive)
@@ -736,8 +736,17 @@ public sealed class FuseMountService : IDisposable
 
     private bool FileExists(string path) => _probeFileExists?.Invoke(path) ?? File.Exists(path);
 
-    private bool IsDirectoryEmpty(string path) => _probeDirectoryEmpty?.Invoke(path)
-        ?? !Directory.EnumerateFileSystemEntries(path).Any();
+    private bool IsDirectoryMountable(string path) => _probeDirectoryEmpty?.Invoke(path)
+        ?? IsEmptyOrIgnoreOnly(path);
+
+    /// <summary>
+    /// True when the directory is empty or contains only top-level
+    /// <c>.ignore</c> marker files (see <c>CreateIgnoreFiles</c>), both of
+    /// which are acceptable mount points.
+    /// </summary>
+    internal static bool IsEmptyOrIgnoreOnly(string path) =>
+        !Directory.EnumerateFileSystemEntries(path)
+            .Any(entry => !string.Equals(Path.GetFileName(entry), ".ignore", StringComparison.Ordinal));
 
     private Task<bool> ProbeConnectionAsync(string mountPoint, CancellationToken ct)
     {

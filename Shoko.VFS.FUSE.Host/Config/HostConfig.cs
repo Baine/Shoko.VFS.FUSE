@@ -104,6 +104,15 @@ public sealed class HostConfig
     /// </summary>
     public uint FuseMountGid { get; set; } = 100;
 
+    /// <summary>
+    /// Create an empty <c>.ignore</c> marker file in each VFS root (mount point)
+    /// directory on the underlying filesystem, so tools that scan the managed
+    /// folder bypassing the mount (rsync, restic, backup scanners, the Unraid
+    /// mover) skip the relay roots. The mounter accepts a mount point that
+    /// contains only <c>.ignore</c> markers. Default: <c>false</c>.
+    /// </summary>
+    public bool CreateIgnoreFiles { get; set; }
+
     /// <summary>Attribute cache timeout in seconds. Default: 2.0.</summary>
     public double AttrTimeout { get; set; } = 2.0;
 

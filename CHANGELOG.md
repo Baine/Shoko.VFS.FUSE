@@ -45,6 +45,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `!ShokoRelayMovieVFS` automatically.
 - **Self-test mode.** `--selftest` runs 15 invariant assertions without
   touching the network or filesystem; suitable for CI.
+- **`.ignore` markers (opt-in).** `CreateIgnoreFiles` writes an empty
+  `.ignore` file into each VFS root directory on the underlying filesystem
+  so scanners that bypass the FUSE mount (rsync, restic, the Unraid mover)
+  skip the relay roots. Disabled by default.
 
 ### Security
 
