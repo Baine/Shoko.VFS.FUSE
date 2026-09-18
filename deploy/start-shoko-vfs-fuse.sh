@@ -46,7 +46,7 @@
 
 set -eu
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 
 SCRIPT_DIR=$(
     CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null
@@ -187,9 +187,27 @@ read_pid() {
 
 list_daemon_pids() {
     # Live daemon PIDs: from the PID file plus any process whose command
-    # line matches the binary (catches rogue/untracked instances). Deduped.
-    for pid in $( { read_pid; pgrep -f -- "$BIN" 2>/dev/null; } | sort -u); do
-        kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+    # line references the binary (catches rogue/untracked instances).
+    # Match by absolute path AND by bare binary name, so instances launched
+    # via a relative path (e.g. "./shoko-vfs-fuse-host") are also caught;
+    # then keep only PIDs whose /proc exe symlink actually resolves to this
+    # binary, so lookalike command lines are never killed.
+    bin_real=$(readlink -f -- "$BIN" 2>/dev/null || printf '%s' "$BIN")
+    bin_base="${BIN##*/}"
+    for pid in $(
+        {
+            read_pid
+            pgrep -f -- "$BIN" 2>/dev/null
+            pgrep -f -- "(^|/|[[:space:]])$bin_base([[:space:]]|\$)" 2>/dev/null
+        } | sort -u); do
+        kill -0 "$pid" 2>/dev/null || continue
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || exe=''
+        if [ -n "$exe" ]; then
+            [ "$exe" = "$bin_real" ] && printf '%s\n' "$pid"
+        else
+            # exe unreadable (e.g. different user); fall back to cmdline match.
+            printf '%s\n' "$pid"
+        fi
     done
 }
 
