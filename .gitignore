@@ -34,6 +34,9 @@ artifacts/
 # Deepwork (local session state)
 .slim/deepwork/
 
+# Local diagnostic logs (never commit)
+test-relay.log
+
 # Local secrets and config (never commit)
 .env
 .env.*

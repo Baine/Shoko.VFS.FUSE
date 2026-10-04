@@ -3,7 +3,6 @@ using Shoko.Abstractions.Metadata;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.Abstractions.Metadata.Services;
 using Shoko.Abstractions.Metadata.Shoko;
-using Shoko.Abstractions.Metadata.Tmdb;
 using Shoko.Abstractions.Video;
 using Shoko.Abstractions.Video.Enums;
 using Shoko.Abstractions.Video.Services;
@@ -49,7 +48,7 @@ public sealed class RelayShokoPathDataSourceLazyTests
             Assert.True(movieEntry.IsMovie);
             var mapping = Assert.Single(movieEntry.Mappings);
             Assert.Equal(2001, mapping.EpisodeId);
-            Assert.Equal(Path.Combine(root, "movie/main.mkv"), mapping.SourcePath);
+            Assert.Equal(Path.Combine(root, "movie", "main.mkv"), mapping.SourcePath);
             Assert.True(mapping.IsMain);
 
             // The TV series graph was never walked past series-level scalars,
@@ -228,7 +227,9 @@ public sealed class RelayShokoPathDataSourceLazyTests
 
         public FakeMetadata(IReadOnlyList<IShokoSeries> series)
         {
-            _byId = series.ToDictionary(item => item.ID);
+            _byId = series
+                .Where(item => item.ID.TryGetNumericID<int>(out _))
+                .ToDictionary(item => item.ID.TryGetNumericID<int>(out var id) ? id : 0);
             All = series;
         }
 
@@ -335,13 +336,20 @@ public sealed class RelayShokoPathDataSourceLazyTests
         int managedFolderId = 7) =>
         MovieSeries(id, (videoId, episodeId, path, relativePath, EpisodeType.Episode));
 
+    private static IMovie TmdbMovie() =>
+        Proxy<IMovie>(
+            ("get_ID", MetadataGuid.For("tmdb", "movie", "1")),
+            ("get_Source", MetadataSource.TMDB),
+            ("get_EntityType", MetadataEntityType.Movie)
+        );
+
     private static (IShokoSeries Series, List<string> Reads) MovieSeries(
         int id,
         params (int VideoId, int EpisodeId, string Path, string RelativePath, EpisodeType EpisodeType)[] episodes) =>
         SeriesWithFiles(
             id,
             id,
-            [Proxy<ITmdbMovie>()],
+            [TmdbMovie()],
             episodes
                 .Select(entry => Episode(
                     entry.EpisodeId,
@@ -354,7 +362,7 @@ public sealed class RelayShokoPathDataSourceLazyTests
     private static (IShokoSeries Series, List<string> Reads) SeriesWithFiles(
         int id,
         int anidbId,
-        IReadOnlyList<ITmdbMovie> tmdbMovies,
+        IReadOnlyList<IMovie> tmdbMovies,
         params IShokoEpisode[] episodes)
     {
         var series = Proxy<IShokoSeries>(
@@ -364,8 +372,8 @@ public sealed class RelayShokoPathDataSourceLazyTests
             ("get_Titles", Array.Empty<ITitle>()),
             ("get_AnidbAnimeID", anidbId),
             ("get_AirDate", null),
-            ("get_TmdbShows", Array.Empty<ITmdbShow>()),
-            ("get_TmdbMovies", tmdbMovies),
+            ("get_LinkedSeries", Array.Empty<ISeries>()),
+            ("get_LinkedMovies", tmdbMovies.ToArray()),
             ("get_Episodes", episodes)
         );
         return (series, ((CountingProxy)(object)series).Reads);
@@ -379,7 +387,7 @@ public sealed class RelayShokoPathDataSourceLazyTests
             ("get_SeasonNumber", season),
             ("get_PreferredTitle", null),
             ("get_Titles", Array.Empty<ITitle>()),
-            ("get_TmdbEpisodes", Array.Empty<ITmdbEpisode>()),
+            ("get_LinkedEpisodes", Array.Empty<IEpisode>()),
             ("get_IsHidden", false),
             ("get_Videos", (IReadOnlyList<IVideo>)[video])
         );
@@ -430,7 +438,12 @@ public sealed class RelayShokoPathDataSourceLazyTests
                 throw new InvalidOperationException("Missing proxy method.");
             Reads.Add(targetMethod.Name);
             if (Members.TryGetValue(targetMethod.Name, out var value))
+            {
+                // Adapt numeric ID members to the current MetadataGuid-based ID API.
+                if (value is int id && targetMethod.ReturnType == typeof(MetadataGuid))
+                    return MetadataGuid.For("shoko", "series", id.ToString());
                 return value;
+            }
             if (targetMethod.Name.StartsWith("get_", StringComparison.Ordinal))
                 return targetMethod.ReturnType.IsValueType
                     ? Activator.CreateInstance(targetMethod.ReturnType)

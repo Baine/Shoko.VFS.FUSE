@@ -3,7 +3,6 @@ using Shoko.Abstractions.Metadata;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.Abstractions.Metadata.Services;
 using Shoko.Abstractions.Metadata.Shoko;
-using Shoko.Abstractions.Metadata.Tmdb;
 using Shoko.Abstractions.Video;
 using Shoko.Abstractions.Video.Enums;
 using Shoko.VFS.FUSE.Naming;
@@ -203,7 +202,7 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
     private static IMetadataService Metadata(params IShokoSeries[] series) =>
         Proxy<IMetadataService>(
             ("GetAllShokoSeries", (IEnumerable<IShokoSeries>)series),
-            ("GetShokoSeriesByID", (Func<object?[], object?>)(args => series.FirstOrDefault(item => item.ID == (int)args[0]!)))
+             ("GetShokoSeriesByID", (Func<object?[], object?>)(args => series.FirstOrDefault(item => item.ID.TryGetNumericID<int>(out var id) && id == (int)args[0]!)))
         );
 
     private static IShokoSeries Series(int id, AnimeType type, string title, params IShokoEpisode[] episodes) =>
@@ -215,8 +214,8 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
             ("get_Titles", (IReadOnlyList<ITitle>)Array.Empty<ITitle>()),
             ("get_AnidbAnimeID", id),
             ("get_AirDate", null),
-            ("get_TmdbShows", (IReadOnlyList<ITmdbShow>)Array.Empty<ITmdbShow>()),
-            ("get_TmdbMovies", (IReadOnlyList<ITmdbMovie>)Array.Empty<ITmdbMovie>()),
+            ("get_LinkedSeries", (IReadOnlyList<ISeries>)Array.Empty<ISeries>()),
+            ("get_LinkedMovies", (IReadOnlyList<IMovie>)Array.Empty<IMovie>()),
             ("get_Episodes", (IReadOnlyList<IShokoEpisode>)episodes)
         );
 
@@ -229,7 +228,7 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
             ("get_Title", title),
             ("get_PreferredTitle", Title(title, "shoko", TitleType.Main)),
             ("get_Titles", (IReadOnlyList<ITitle>)Array.Empty<ITitle>()),
-            ("get_TmdbEpisodes", (IReadOnlyList<ITmdbEpisode>)Array.Empty<ITmdbEpisode>()),
+            ("get_LinkedEpisodes", (IReadOnlyList<IEpisode>)Array.Empty<IEpisode>()),
             ("get_IsHidden", hidden),
             ("get_Videos", (IReadOnlyList<IVideo>)videos)
         );
@@ -320,7 +319,12 @@ public sealed class RelayShokoPathDataSourceThemeMp3Tests
             if (ThrowingMembers.Contains(targetMethod.Name))
                 throw new InvalidOperationException($"Unexpected source probe: {targetMethod.Name}");
             if (Members.TryGetValue(targetMethod.Name, out var value))
-                return value is Func<object?[], object?> invokable ? invokable(args ?? []) : value;
+            {
+                value = value is Func<object?[], object?> invokable ? invokable(args ?? []) : value;
+                return value is int id && targetMethod.ReturnType == typeof(MetadataGuid)
+                    ? MetadataGuid.For("shoko", "series", id.ToString())
+                    : value;
+            }
             throw new InvalidOperationException($"Unexpected member read: {targetMethod.DeclaringType?.Name}.{targetMethod.Name}");
         }
     }

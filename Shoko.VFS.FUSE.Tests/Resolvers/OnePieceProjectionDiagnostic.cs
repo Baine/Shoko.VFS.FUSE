@@ -66,6 +66,8 @@ public sealed class OnePieceProjectionDiagnostic
     {
         var path = Environment.GetEnvironmentVariable("ONE_PIECE_JSON") ?? "/tmp/opencode/onepiece/op_eps.json";
         var dataDir = Environment.GetEnvironmentVariable("ONE_PIECE_TEST_DATA") ?? "/tmp/opencode/onepiece_test_data";
+        if (!OnePieceFixture.CanRunDiagnostic(dataDir, path))
+            return;
         await OnePieceFixture.EnsureRecordedAsync(dataDir, path).ConfigureAwait(false);
         Assert.True(File.Exists(path), $"One Piece JSON not found at {path}");
 

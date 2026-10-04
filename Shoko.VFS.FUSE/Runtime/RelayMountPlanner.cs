@@ -158,7 +158,7 @@ public sealed class RelayMountPlanner
             folder.Name,
             folderPath,
             rootName,
-            Path.Combine(folderPath, rootName),
+            CombineCanonicalPath(folderPath, rootName),
             rootKind,
             options));
     }
@@ -168,6 +168,11 @@ public sealed class RelayMountPlanner
         MovieGenerationMode.EnabledRemove => new PathResolverOptions { Shows = true, MoviesAsTv = false, SeriesCacheTtl = SeriesCacheTtl(configuration) },
         _ => new PathResolverOptions { Shows = true, MoviesAsTv = true, SeriesCacheTtl = SeriesCacheTtl(configuration) },
     };
+
+    private static string CombineCanonicalPath(string root, string child) =>
+        OperatingSystem.IsWindows() && root.StartsWith("/", StringComparison.Ordinal)
+            ? $"{root.TrimEnd('/')}/{child}"
+            : Path.Combine(root, child);
 
     private static PathResolverOptions MovieOptions(FusePluginConfiguration configuration) => new()
     {
@@ -196,12 +201,18 @@ public sealed class RelayMountPlanner
             && !relative.StartsWith(".." + Path.AltDirectorySeparatorChar, PathComparison);
     }
 
-    private static string CanonicalPath(string path) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+    private static string CanonicalPath(string path)
+    {
+        if (OperatingSystem.IsWindows() && path.StartsWith("/", StringComparison.Ordinal))
+            return path.Replace('\\', '/').TrimEnd('/');
+        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+    }
 
     private static bool TryCanonicalPath(string? path, out string canonical)
     {
         canonical = "";
-        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+        if (string.IsNullOrWhiteSpace(path)
+            || (!Path.IsPathFullyQualified(path) && !(OperatingSystem.IsWindows() && path.StartsWith("/", StringComparison.Ordinal))))
             return false;
 
         try

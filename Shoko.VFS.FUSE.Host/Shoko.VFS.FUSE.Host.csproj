@@ -11,14 +11,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.10" />
-    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.10" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.10" />
-    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="11.0.0-rc.1.26425.128" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="11.0.0-rc.1.26425.128" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="11.0.0-rc.1.26425.128" />
+    <PackageReference Include="Newtonsoft.Json" Version="14.0.1-beta2" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.84" />
+    <PackageReference Include="Shoko.Abstractions" Version="6.0.0-alpha.98" />
     <ProjectReference Include="..\Shoko.VFS.FUSE\Shoko.VFS.FUSE.csproj" />
   </ItemGroup>
 

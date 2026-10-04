@@ -3,7 +3,6 @@ using Shoko.Abstractions.Metadata;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.Abstractions.Metadata.Services;
 using Shoko.Abstractions.Metadata.Shoko;
-using Shoko.Abstractions.Metadata.Tmdb;
 using Shoko.Abstractions.Video;
 using Shoko.Abstractions.Video.Enums;
 using Shoko.VFS.FUSE.Naming;
@@ -427,35 +426,35 @@ public sealed class RelayLocalAssetLinkerTests
 
     private static IShokoSeries Series(int id, AnimeType type, string title, params IShokoEpisode[] episodes) =>
         Proxy<IShokoSeries>(
-            ("get_ID", id),
+            ("get_ID", MetadataGuid.For("shoko", "series", id.ToString())),
             ("get_Type", type),
             ("get_Title", title),
             ("get_PreferredTitle", Title(title, "shoko", TitleType.Main)),
             ("get_Titles", (IReadOnlyList<ITitle>)Array.Empty<ITitle>()),
             ("get_AnidbAnimeID", id),
             ("get_AirDate", null),
-            ("get_TmdbShows", (IReadOnlyList<ITmdbShow>)Array.Empty<ITmdbShow>()),
-            ("get_TmdbMovies", (IReadOnlyList<ITmdbMovie>)Array.Empty<ITmdbMovie>()),
+            ("get_LinkedSeries", (IReadOnlyList<ISeries>)Array.Empty<ISeries>()),
+            ("get_LinkedMovies", (IReadOnlyList<IMovie>)Array.Empty<IMovie>()),
             ("get_Episodes", (IReadOnlyList<IShokoEpisode>)episodes)
         );
 
     private static IShokoEpisode Episode(int id, EpisodeType type, int number, int? season, string title, bool hidden, params IVideo[] videos) =>
         Proxy<IShokoEpisode>(
-            ("get_ID", id),
+            ("get_ID", MetadataGuid.For("shoko", "episode", id.ToString())),
             ("get_Type", type),
             ("get_EpisodeNumber", number),
             ("get_SeasonNumber", season),
             ("get_Title", title),
             ("get_PreferredTitle", Title(title, "shoko", TitleType.Main)),
             ("get_Titles", (IReadOnlyList<ITitle>)Array.Empty<ITitle>()),
-            ("get_TmdbEpisodes", (IReadOnlyList<ITmdbEpisode>)Array.Empty<ITmdbEpisode>()),
+            ("get_LinkedEpisodes", (IReadOnlyList<IEpisode>)Array.Empty<IEpisode>()),
             ("get_IsHidden", hidden),
             ("get_Videos", (IReadOnlyList<IVideo>)videos)
         );
 
     private static IVideo Video(int id, IReadOnlyList<IVideoFile> files) =>
         Proxy<IVideo>(
-            ("get_ID", id),
+            ("get_ID", MetadataGuid.For("shoko", "video", id.ToString())),
             ("get_IsVariation", false),
             ("get_Files", files),
             ("get_CrossReferences", (IReadOnlyList<IVideoCrossReference>)Array.Empty<IVideoCrossReference>())
@@ -540,7 +539,9 @@ public sealed class RelayLocalAssetLinkerTests
             if (targetMethod is null)
                 throw new InvalidOperationException("Missing proxy method.");
             if (Members.TryGetValue(targetMethod.Name, out var value))
-                return value;
+                return value is int id && targetMethod.ReturnType == typeof(MetadataGuid)
+                    ? MetadataGuid.For("shoko", "series", id.ToString())
+                    : value;
             throw new InvalidOperationException($"Unexpected member read: {targetMethod.DeclaringType?.Name}.{targetMethod.Name}");
         }
     }

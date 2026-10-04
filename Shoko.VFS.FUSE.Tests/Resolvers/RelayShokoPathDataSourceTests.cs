@@ -3,7 +3,6 @@ using Shoko.Abstractions.Metadata;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.Abstractions.Metadata.Services;
 using Shoko.Abstractions.Metadata.Shoko;
-using Shoko.Abstractions.Metadata.Tmdb;
 using Shoko.Abstractions.Video;
 using Shoko.Abstractions.Video.Enums;
 using Shoko.VFS.FUSE.Models;
@@ -63,7 +62,7 @@ public sealed class RelayShokoPathDataSourceTests
         try
         {
             string sourcePath = WriteFile(root, "tmdb.mkv");
-            var tmdbEpisode = TmdbEpisode(1, 1, "default", "TMDB title", TmdbEpisodeOrdering("preferred", 2, 5));
+            var tmdbEpisode = TmdbEpisode(1, 1, "default", "TMDB title", TmdbOrderingInformation("preferred", 2, 5));
             var episode = EpisodeWithTmdb(1101, EpisodeType.Episode, 1, 1, "Episode 1", false, [tmdbEpisode], [], Video(501, [Location(7, true, sourcePath, "/tmdb.mkv")]));
             var series = SeriesWithTmdb(
                 56,
@@ -83,7 +82,7 @@ public sealed class RelayShokoPathDataSourceTests
             Assert.True(data.IsMovie);
             Assert.Equal(2, mapping.Season);
             Assert.Equal(5, mapping.Episode);
-            Assert.Contains("get_AllOrderings", ((StrictDispatchProxy)(object)tmdbEpisode).Reads);
+            Assert.Contains("get_PreferredOrdering", ((StrictDispatchProxy)(object)tmdbEpisode).Reads);
         }
         finally
         {
@@ -118,7 +117,7 @@ public sealed class RelayShokoPathDataSourceTests
                 .Single();
 
             Assert.Equal((2, 7), (mapping.Season, mapping.Episode));
-            Assert.DoesNotContain("get_AllOrderings", ((StrictDispatchProxy)(object)tmdbEpisode).Reads);
+            Assert.DoesNotContain("get_Orderings", ((StrictDispatchProxy)(object)tmdbEpisode).Reads);
         }
         finally
         {
@@ -210,7 +209,7 @@ public sealed class RelayShokoPathDataSourceTests
             Assert.DoesNotContain("get_Path", ((StrictDispatchProxy)(object)file).Reads);
             Assert.DoesNotContain("get_RelativePath", ((StrictDispatchProxy)(object)file).Reads);
             Assert.DoesNotContain("get_Size", ((StrictDispatchProxy)(object)file).Reads);
-            Assert.DoesNotContain("get_TmdbEpisodes", ((StrictDispatchProxy)(object)episode).Reads);
+            Assert.DoesNotContain("get_LinkedEpisodes", ((StrictDispatchProxy)(object)episode).Reads);
         }
         finally
         {
@@ -388,8 +387,8 @@ public sealed class RelayShokoPathDataSourceTests
         string root = NewDirectory();
         try
         {
-            var firstTmdbEpisode = TmdbEpisode(1, 1, "default", null, TmdbEpisodeOrdering("900", 2, 5));
-            var secondTmdbEpisode = TmdbEpisode(1, 2, "default", null, TmdbEpisodeOrdering("900", 2, 6));
+            var firstTmdbEpisode = TmdbEpisode(1, 1, "default", null, TmdbOrderingInformation("900", 2, 5));
+            var secondTmdbEpisode = TmdbEpisode(1, 2, "default", null, TmdbOrderingInformation("900", 2, 6));
             var video = Video(1202, [Location(7, true, "/unused", "/joined.mkv")]);
             var first = EpisodeWithTmdb(12021, EpisodeType.Episode, 1, 1, "One", false, [firstTmdbEpisode], [], video);
             var second = EpisodeWithTmdb(12022, EpisodeType.Episode, 2, 1, "Two", false, [secondTmdbEpisode], [], video);
@@ -402,8 +401,10 @@ public sealed class RelayShokoPathDataSourceTests
                 .Single();
 
             Assert.Equal((2, 5, 6), (mapping.Season, mapping.Episode, mapping.EndEpisode));
-            Assert.Contains("get_AllOrderings", ((StrictDispatchProxy)(object)firstTmdbEpisode).Reads);
-            Assert.Contains("get_AllOrderings", ((StrictDispatchProxy)(object)secondTmdbEpisode).Reads);
+            // The next assertions validate that alternate ordering rows were read,
+            // focusing the subsequent checks on ordering-ID mapping rather than values.
+            Assert.Contains("get_Orderings", ((StrictDispatchProxy)(object)firstTmdbEpisode).Reads);
+            Assert.Contains("get_Orderings", ((StrictDispatchProxy)(object)secondTmdbEpisode).Reads);
         }
         finally
         {
@@ -437,7 +438,7 @@ public sealed class RelayShokoPathDataSourceTests
             ).GetAllSeries().Single().Mappings.Single();
 
             Assert.Equal((4, 8), (mapping.Season, mapping.Episode));
-            Assert.DoesNotContain("get_AllOrderings", ((StrictDispatchProxy)(object)tmdbEpisode).Reads);
+            Assert.DoesNotContain("get_Orderings", ((StrictDispatchProxy)(object)tmdbEpisode).Reads);
         }
         finally
         {
@@ -469,7 +470,7 @@ public sealed class RelayShokoPathDataSourceTests
                 .GetAllSeries().Single().Mappings.Single();
 
             Assert.Equal((3, 9), (mapping.Season, mapping.Episode));
-            Assert.Contains("get_AllOrderings", ((StrictDispatchProxy)(object)tmdbEpisode).Reads);
+            Assert.Contains("get_PreferredOrdering", ((StrictDispatchProxy)(object)tmdbEpisode).Reads);
         }
         finally
         {
@@ -1069,8 +1070,8 @@ public sealed class RelayShokoPathDataSourceTests
             ("get_Titles", (IReadOnlyList<ITitle>)Array.Empty<ITitle>()),
             ("get_AnidbAnimeID", id),
             ("get_AirDate", null),
-            ("get_TmdbShows", (IReadOnlyList<ITmdbShow>)Array.Empty<ITmdbShow>()),
-            ("get_TmdbMovies", (IReadOnlyList<ITmdbMovie>)Array.Empty<ITmdbMovie>()),
+            ("get_LinkedSeries", (IReadOnlyList<ISeries>)Array.Empty<ISeries>()),
+            ("get_LinkedMovies", (IReadOnlyList<IMovie>)Array.Empty<IMovie>()),
             ("get_Episodes", (IReadOnlyList<IShokoEpisode>)episodes)
         );
 
@@ -1078,8 +1079,8 @@ public sealed class RelayShokoPathDataSourceTests
         int id,
         AnimeType type,
         string title,
-        IReadOnlyList<ITmdbShow> tmdbShows,
-        IReadOnlyList<ITmdbMovie> tmdbMovies,
+        IReadOnlyList<ISeries> tmdbShows,
+        IReadOnlyList<IMovie> tmdbMovies,
         int anidbAnimeId,
         PartialDateOnly? airDate,
         IReadOnlyList<ITitle> titles,
@@ -1092,8 +1093,8 @@ public sealed class RelayShokoPathDataSourceTests
             ("get_Titles", titles),
             ("get_AnidbAnimeID", anidbAnimeId),
             ("get_AirDate", airDate),
-            ("get_TmdbShows", tmdbShows),
-            ("get_TmdbMovies", tmdbMovies),
+            ("get_LinkedSeries", tmdbShows.ToArray()),
+            ("get_LinkedMovies", tmdbMovies.ToArray()),
             ("get_Episodes", (IReadOnlyList<IShokoEpisode>)episodes)
         );
 
@@ -1106,7 +1107,7 @@ public sealed class RelayShokoPathDataSourceTests
             ("get_Title", title),
             ("get_PreferredTitle", Title(title, "shoko", TitleType.Main)),
             ("get_Titles", (IReadOnlyList<ITitle>)Array.Empty<ITitle>()),
-            ("get_TmdbEpisodes", (IReadOnlyList<ITmdbEpisode>)Array.Empty<ITmdbEpisode>()),
+            ("get_LinkedEpisodes", (IReadOnlyList<IShokoEpisode>)Array.Empty<IShokoEpisode>()),
             ("get_IsHidden", hidden),
             ("get_Videos", (IReadOnlyList<IVideo>)videos)
         );
@@ -1118,7 +1119,7 @@ public sealed class RelayShokoPathDataSourceTests
         int? season,
         string title,
         bool hidden,
-        IReadOnlyList<ITmdbEpisode> tmdbEpisodes,
+        IReadOnlyList<IEpisode> tmdbEpisodes,
         IReadOnlyList<ITitle> titles,
         params IVideo[] videos) =>
         Proxy<IShokoEpisode>(
@@ -1129,7 +1130,7 @@ public sealed class RelayShokoPathDataSourceTests
             ("get_Title", title),
             ("get_PreferredTitle", null),
             ("get_Titles", titles),
-            ("get_TmdbEpisodes", tmdbEpisodes),
+            ("get_LinkedEpisodes", tmdbEpisodes.ToArray()),
             ("get_IsHidden", hidden),
             ("get_Videos", (IReadOnlyList<IVideo>)videos)
         );
@@ -1141,47 +1142,60 @@ public sealed class RelayShokoPathDataSourceTests
             ("get_Type", type)
         );
 
-    private static ITmdbShow TmdbShow(int id, string? preferredOrderingId) =>
-        Proxy<ITmdbShow>(
-            ("get_ID", id),
+    private static ISeries TmdbShow(int id, string? preferredOrderingId) =>
+        Proxy<ISeries>(
+            ("get_ID", MetadataGuid.For("tmdb", "series", id.ToString())),
+            ("get_Source", MetadataSource.TMDB),
+            ("get_EntityType", MetadataEntityType.Series),
             ("get_PreferredOrdering", preferredOrderingId is null ? null : TmdbShowOrdering(preferredOrderingId))
         );
 
-    private static ITmdbShowOrderingInformation TmdbShowOrdering(string orderingId) =>
-        Proxy<ITmdbShowOrderingInformation>(
-            ("get_OrderingID", orderingId)
+    private static IOrdering TmdbShowOrdering(string orderingId) =>
+        Proxy<IOrdering>(
+            ("get_ID", MetadataGuid.For("tmdb", "ordering", orderingId))
         );
 
-    private static ITmdbEpisode TmdbEpisode(
+    private static IEpisode TmdbEpisode(
         int? season,
         int episode,
         string orderingId,
         string? title = null,
-        params ITmdbEpisodeOrderingInformation[] allOrderings) =>
-        Proxy<ITmdbEpisode>(
-            ("get_SeasonNumber", season),
+        params IEpisodeOrderingInformation[] allOrderings) =>
+        Proxy<IEpisode>(
+            ("get_ID", MetadataGuid.For("tmdb", "episode", episode.ToString())),
+            ("get_Source", MetadataSource.TMDB),
+            ("get_EntityType", MetadataEntityType.Episode),
             ("get_EpisodeNumber", episode),
-            ("get_OrderingID", orderingId),
-            ("get_AllOrderings", (IReadOnlyList<ITmdbEpisodeOrderingInformation>)allOrderings),
+            ("get_SeasonNumber", season),
+            ("get_PreferredOrdering", TmdbOrderingInformation(orderingId, season, episode)),
+            ("get_Orderings", (IReadOnlyList<IEpisodeOrderingInformation>)allOrderings),
             ("get_PreferredTitle", title is null ? null : Title(title, "en", TitleType.Official))
         );
 
-    private static ITmdbEpisode TmdbEpisodeWithoutAlternateOrderings(int? season, int episode, string orderingId) =>
-        Proxy<ITmdbEpisode>(
-            ("get_SeasonNumber", season),
+    private static IEpisode TmdbEpisodeWithoutAlternateOrderings(int? season, int episode, string orderingId) =>
+        Proxy<IEpisode>(
+            ("get_ID", MetadataGuid.For("tmdb", "episode", episode.ToString())),
+            ("get_Source", MetadataSource.TMDB),
+            ("get_EntityType", MetadataEntityType.Episode),
             ("get_EpisodeNumber", episode),
-            ("get_OrderingID", orderingId),
+            ("get_SeasonNumber", season),
+            ("get_PreferredOrdering", TmdbOrderingInformation(orderingId, season, episode)),
             ("get_PreferredTitle", null)
         );
 
-    private static ITmdbEpisodeOrderingInformation TmdbEpisodeOrdering(string orderingId, int season, int episode) =>
-        Proxy<ITmdbEpisodeOrderingInformation>(
-            ("get_OrderingID", orderingId),
+    private static IEpisodeOrderingInformation TmdbOrderingInformation(string orderingId, int? season, int episode) =>
+        Proxy<IEpisodeOrderingInformation>(
+            ("get_OrderingID", MetadataGuid.For("tmdb", "ordering", orderingId)),
             ("get_SeasonNumber", season),
             ("get_EpisodeNumber", episode)
         );
 
-    private static ITmdbMovie TmdbMovie() => Proxy<ITmdbMovie>();
+    private static IMovie TmdbMovie() =>
+        Proxy<IMovie>(
+            ("get_ID", MetadataGuid.For("tmdb", "movie", "1")),
+            ("get_Source", MetadataSource.TMDB),
+            ("get_EntityType", MetadataEntityType.Movie)
+        );
 
     private static IVideo Video(int id, IReadOnlyList<IVideoFile> files, bool variation = false, params IVideoCrossReference[] crossReferences) =>
         Proxy<IVideo>(
@@ -1325,7 +1339,9 @@ public sealed class RelayShokoPathDataSourceTests
             if (ThrowingMembers.Contains(targetMethod.Name))
                 throw new InvalidOperationException($"Unexpected source probe: {targetMethod.Name}");
             if (Members.TryGetValue(targetMethod.Name, out var value))
-                return value;
+                return value is int id && targetMethod.ReturnType == typeof(MetadataGuid)
+                    ? MetadataGuid.For("shoko", "series", id.ToString())
+                    : value;
             throw new InvalidOperationException($"Unexpected member read: {targetMethod.DeclaringType?.Name}.{targetMethod.Name}");
         }
     }

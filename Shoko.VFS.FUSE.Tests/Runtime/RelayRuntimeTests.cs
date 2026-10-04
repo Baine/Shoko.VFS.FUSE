@@ -6,6 +6,7 @@ using Shoko.Abstractions.Config.Events;
 using Shoko.Abstractions.Config.Services;
 using Shoko.Abstractions.Core.Services;
 using Shoko.Abstractions.Metadata.Services;
+using Shoko.Abstractions.Metadata;
 using Shoko.Abstractions.Plugin;
 using Shoko.Abstractions.Video;
 using Shoko.Abstractions.Video.Enums;
@@ -20,6 +21,8 @@ namespace Shoko.VFS.FUSE.Tests.Runtime;
 
 public sealed class RelayRuntimeTests
 {
+    private static readonly string TestRoot = Path.Combine(Path.GetTempPath(), "Shoko.VFS.FUSE.Tests");
+
     [Fact]
     public async Task WaitsForStartupAndContentEventsOnlyInvalidate()
     {
@@ -45,7 +48,7 @@ public sealed class RelayRuntimeTests
         using var fixture = new RuntimeFixture(new FusePluginConfiguration { RelayEnabled = true, PlexLocalExtras = false });
         await fixture.Runtime.StartAsync(CancellationToken.None);
         fixture.System.CompleteStartup();
-        await Eventually(() => fixture.Starts == 1);
+        await Eventually(() => fixture.Starts == 1, () => $"starts={fixture.Starts}, state={fixture.Runtime.Status.State}, desired={fixture.Runtime.Status.DesiredMountCount}, failed={fixture.Runtime.Status.FailedMountCount}, capabilities={string.Join(',', fixture.Runtime.Status.CapabilityCodes)}");
 
         fixture.Video.RaiseHashed(42, 43);
         await Eventually(() => fixture.SeriesInvalidations.Count == 2);
@@ -111,14 +114,14 @@ public sealed class RelayRuntimeTests
     {
         using var fixture = new RuntimeFixture(
             new FusePluginConfiguration { RelayEnabled = true, PlexLocalExtras = false },
-            [Folder(1, "One", "/tmp/library-one"), Folder(2, "Two", "/tmp/library-two")]
+            [Folder(1, "One", Path.Combine(TestRoot, "library-one")), Folder(2, "Two", Path.Combine(TestRoot, "library-two"))]
         );
         await fixture.Runtime.StartAsync(CancellationToken.None);
         fixture.System.CompleteStartup();
         await Eventually(() => fixture.Starts == 2);
 
         var removed = fixture.Video.GetFolder(2);
-        fixture.Video.SetFolders([Folder(1, "One", "/tmp/library-one")]);
+        fixture.Video.SetFolders([Folder(1, "One", Path.Combine(TestRoot, "library-one"))]);
         fixture.Video.RaiseManagedFolderRemoved(removed);
         await Eventually(() => fixture.Stops == 1 && fixture.Runtime.Status.ActiveMountCount == 1);
 
@@ -133,16 +136,16 @@ public sealed class RelayRuntimeTests
     {
         using var fixture = new RuntimeFixture(
             new FusePluginConfiguration { RelayEnabled = true, PlexLocalExtras = false },
-            [Folder(1, "One", "/tmp/library-one")]
+            [Folder(1, "One", Path.Combine(TestRoot, "library-one"))]
         )
         {
             FailFolderId = 2,
         };
         await fixture.Runtime.StartAsync(CancellationToken.None);
         fixture.System.CompleteStartup();
-        await Eventually(() => fixture.Starts == 1);
+        await Eventually(() => fixture.Starts == 1, () => $"starts={fixture.Starts}, state={fixture.Runtime.Status.State}, desired={fixture.Runtime.Status.DesiredMountCount}, failed={fixture.Runtime.Status.FailedMountCount}, capabilities={string.Join(',', fixture.Runtime.Status.CapabilityCodes)}");
 
-        fixture.Video.SetFolders([Folder(1, "One", "/tmp/library-one"), Folder(2, "Two", "/tmp/library-two")]);
+        fixture.Video.SetFolders([Folder(1, "One", Path.Combine(TestRoot, "library-one")), Folder(2, "Two", Path.Combine(TestRoot, "library-two"))]);
         fixture.Video.RaiseManagedFolderAdded(fixture.Video.GetFolder(2));
         await Eventually(() => fixture.Runtime.Status.FailedMountCount == 1);
 
@@ -221,7 +224,7 @@ public sealed class RelayRuntimeTests
         fixture.RaiseCurrentDaemonStopped();
         await Eventually(() => fixture.Runtime.PendingLeaseCount == 0
             && fixture.Runtime.Status.ActiveMountCount == 0
-            && !fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, new FileInfo("/tmp/!ShokoRelayVFS/episode.mkv")));
+            && !fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, new FileInfo(Path.Combine(Path.GetTempPath(), "!ShokoRelayVFS", "episode.mkv"))));
 
         Assert.Equal(0, fixture.Stops);
         await fixture.Runtime.StopAsync(CancellationToken.None);
@@ -240,7 +243,7 @@ public sealed class RelayRuntimeTests
         fixture.RaiseCurrentDaemonStopped();
         await Eventually(() => fixture.Runtime.PendingLeaseCount == 0
             && fixture.Runtime.Status.ActiveMountCount == 0
-            && !fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, new FileInfo("/tmp/!ShokoRelayVFS/episode.mkv")));
+            && !fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, new FileInfo(Path.Combine(Path.GetTempPath(), "!ShokoRelayVFS", "episode.mkv"))));
 
         fixture.ReleaseStart();
         await Eventually(() => fixture.Starts == 2 && fixture.Runtime.Status.ActiveMountCount == 1,
@@ -267,7 +270,7 @@ public sealed class RelayRuntimeTests
         await fixture.PendingCleanupNotification!.Task;
         await Eventually(() => fixture.Runtime.PendingLeaseCount == 0
             && fixture.Runtime.Status.ActiveMountCount == 0
-            && !fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, new FileInfo("/tmp/!ShokoRelayVFS/episode.mkv")));
+            && !fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, new FileInfo(Path.Combine(Path.GetTempPath(), "!ShokoRelayVFS", "episode.mkv"))));
 
         fixture.ReleaseStart();
         await Eventually(() => fixture.Starts == 2 && fixture.Runtime.Status.ActiveMountCount == 1,
@@ -279,12 +282,12 @@ public sealed class RelayRuntimeTests
     public async Task IgnoreRuleTracksOnlyActiveRuntimeRoots()
     {
         using var fixture = new RuntimeFixture(new FusePluginConfiguration { RelayEnabled = true, PlexLocalExtras = false });
-        var file = new FileInfo("/tmp/!ShokoRelayVFS/episode.mkv");
+        var file = new FileInfo(Path.Combine(Path.GetTempPath(), "!ShokoRelayVFS", "episode.mkv"));
 
         Assert.False(fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, file));
         await fixture.Runtime.StartAsync(CancellationToken.None);
         fixture.System.CompleteStartup();
-        await Eventually(() => fixture.Starts == 1);
+        await Eventually(() => fixture.Starts == 1 && fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, file));
         Assert.True(fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, file));
 
         await fixture.Runtime.StopAsync(CancellationToken.None);
@@ -405,7 +408,7 @@ public sealed class RelayRuntimeTests
         fixture.HoldNextStart();
         fixture.RaiseUnexpectedStop();
         await Eventually(() => fixture.Runtime.Status.ActiveMountCount == 0
-            && !fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, new FileInfo("/tmp/!ShokoRelayVFS/episode.mkv")));
+            && !fixture.Runtime.IgnoreRule.ShouldIgnore(fixture.Video.Folder, new FileInfo(Path.Combine(Path.GetTempPath(), "!ShokoRelayVFS", "episode.mkv"))));
 
         fixture.ReleaseStart();
         await Eventually(() => fixture.Starts == 2);
@@ -594,6 +597,15 @@ public sealed class RelayRuntimeTests
 
         public void Dispose()
         {
+            ReleaseStart();
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                Runtime.StopAsync(timeout.Token).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException)
+            {
+            }
             _provider.Dispose();
         }
     }
@@ -699,7 +711,7 @@ public sealed class RelayRuntimeTests
 
         public FakeVideo(IReadOnlyList<FolderSpec>? folders = null)
         {
-            SetFolders(folders ?? [new FolderSpec(1, "Library", "/tmp", DropFolderType.Excluded)]);
+            SetFolders(folders ?? [new FolderSpec(1, "Library", Path.GetTempPath(), DropFolderType.Excluded)]);
             var proxy = DispatchProxy.Create<IVideoService, VideoProxy>();
             ((VideoProxy)(object)proxy).Owner = this;
             Proxy = proxy;
@@ -760,7 +772,7 @@ public sealed class RelayRuntimeTests
             internal int Id { get; set; }
 
             protected override object? Invoke(MethodInfo? method, object?[]? args) =>
-                method?.Name == "get_ID" ? Id : Default(method?.ReturnType);
+                method?.Name == "get_ID" ? MetadataGuid.For("shoko", "series", Id.ToString()) : Default(method?.ReturnType);
         }
 
         private class VideoProxy : DispatchProxy
@@ -839,7 +851,7 @@ public sealed class RelayRuntimeTests
         public FakePaths()
         {
             var proxy = DispatchProxy.Create<IApplicationPaths, PathsProxy>();
-            ((PathsProxy)(object)proxy).Data = "/tmp";
+            ((PathsProxy)(object)proxy).Data = Path.GetTempPath();
             Proxy = proxy;
         }
 

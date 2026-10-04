@@ -14,7 +14,7 @@ public sealed class MountIdentityTests
 
         Assert.True(FuseMountService.TryParseMountInfo(line, out var entry));
         Assert.Equal(42, entry.MountId);
-        Assert.Equal("/tmp/Relay Root\tOne", entry.CanonicalPath);
+        Assert.Equal(Path.GetFullPath("/tmp/Relay Root\tOne"), entry.CanonicalPath);
         Assert.Equal("fuse.shoko-vfs", entry.FileSystemType);
         Assert.Equal("Shoko.VFS.FUSE:token", entry.SourceToken);
     }

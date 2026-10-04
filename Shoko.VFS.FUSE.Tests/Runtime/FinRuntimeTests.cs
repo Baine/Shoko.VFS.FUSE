@@ -201,6 +201,15 @@ public sealed class FinRuntimeTests
 
         public void Dispose()
         {
+            ReleaseStart();
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                Runtime.StopAsync(timeout.Token).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException)
+            {
+            }
             _provider.Dispose();
         }
     }

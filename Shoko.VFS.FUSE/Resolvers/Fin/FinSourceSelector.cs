@@ -55,7 +55,7 @@ public static class FinSourceSelector
                 {
                     var identity = identities[0];
                     singleSeriesIds.Add(identity.SeriesId);
-                    admitted.Add(new FinAdmittedFile(sourcePath, file.FileId, identity.SeriesId, identity.AniDbId));
+                    admitted.Add(new FinAdmittedFile(NormalizePosixPath(sourcePath), file.FileId, identity.SeriesId, identity.AniDbId));
                 }
                 else if (identities.Count > 1)
                 {
@@ -72,12 +72,17 @@ public static class FinSourceSelector
                 if ((singleSeriesIds.Contains(identity.SeriesId)
                         || profile.MultiSeriesAniDbAllowlist.Contains(identity.AniDbId))
                     && admittedSeriesIds.Add(identity.SeriesId))
-                    admitted.Add(new FinAdmittedFile(file.SourcePath, file.FileId, identity.SeriesId, identity.AniDbId));
+                    admitted.Add(new FinAdmittedFile(NormalizePosixPath(file.SourcePath), file.FileId, identity.SeriesId, identity.AniDbId));
             }
         }
 
         return admitted.AsReadOnly();
     }
+
+    private static string NormalizePosixPath(string path) =>
+        OperatingSystem.IsWindows() && path.StartsWith("/", StringComparison.Ordinal)
+            ? path.Replace('\\', '/')
+            : path;
 
     private static List<SeriesIdentity> EligibleSeries(
         IReadOnlyList<FinRawFileCrossReference> crossReferences)

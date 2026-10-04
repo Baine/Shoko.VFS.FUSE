@@ -121,7 +121,6 @@ public sealed class RelayRuntime : BackgroundService
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _ignoreRule = new RelayIgnoreRule();
         _status = new RelayHealthStatus(RelayRuntimeState.WaitingForServer, [], [], 0, 0, 0);
-        RegisterIgnoreRule();
     }
 
     public RelayHealthStatus Status => Volatile.Read(ref _status);
@@ -654,13 +653,19 @@ public sealed class RelayRuntime : BackgroundService
     {
         // Subclasses (Hashed, FileRelocated) share the linked-series snapshot.
         VideoFileEventArgs fileEvent => fileEvent.Series is { } series
-            ? series.Where(link => link is not null).Select(link => link.ID).ToList()
+            ? series.Where(link => link is not null)
+                .Select(link => link.ID.TryGetNumericID<int>(out var id) ? id : 0)
+                .Where(id => id != 0).ToList()
             : [],
         VideoReleaseSavedEventArgs saved => saved.Video?.Series is { } series
-            ? series.Where(link => link is not null).Select(link => link.ID).ToList()
+            ? series.Where(link => link is not null)
+                .Select(link => link.ID.TryGetNumericID<int>(out var id) ? id : 0)
+                .Where(id => id != 0).ToList()
             : [],
         VideoReleaseDeletedEventArgs deleted => deleted.Video?.Series is { } series
-            ? series.Where(link => link is not null).Select(link => link.ID).ToList()
+            ? series.Where(link => link is not null)
+                .Select(link => link.ID.TryGetNumericID<int>(out var id) ? id : 0)
+                .Where(id => id != 0).ToList()
             : [],
         _ => null,
     };
@@ -711,27 +716,6 @@ public sealed class RelayRuntime : BackgroundService
         }
         catch (ObjectDisposedException)
         {
-        }
-    }
-
-    private void RegisterIgnoreRule()
-    {
-        try
-        {
-            if (_videoService.IgnoreRules.Count > 0)
-            {
-                AddCapability("IgnoreRuleRegistrationUnavailable");
-                return;
-            }
-
-            _videoService.AddParts([_ignoreRule]);
-            if (!_videoService.IgnoreRules.Contains(_ignoreRule))
-                AddCapability("IgnoreRuleRegistrationUnavailable");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Relay ignore rule could not be registered.");
-            AddCapability("IgnoreRuleRegistrationUnavailable");
         }
     }
 

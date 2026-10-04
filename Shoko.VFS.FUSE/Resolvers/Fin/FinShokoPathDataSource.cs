@@ -1,3 +1,4 @@
+using Shoko.Abstractions.Metadata;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.Abstractions.Metadata.Services;
 using Shoko.Abstractions.Metadata.Shoko;
@@ -72,7 +73,15 @@ public sealed class FinShokoPathDataSource : IVirtualTreeDataSource
     private IReadOnlyList<FinRawFile> BuildRawFiles()
     {
         var allSeries = (_metadataService.GetAllShokoSeries() ?? Array.Empty<IShokoSeries>()).ToArray();
-        var bySeries = allSeries.ToDictionary(series => series.ID);
+
+        // Build dictionary keyed by numeric Shoko series ID when available.
+        var bySeries = new Dictionary<int, IShokoSeries>();
+        foreach (var series in allSeries)
+        {
+            if (series.ID.TryGetNumericID<int>(out var sid))
+                bySeries[sid] = series;
+        }
+
         var files = new Dictionary<int, (List<FinRawLocation> Locations, List<FinRawFileCrossReference> CrossRefs)>();
 
         foreach (var series in allSeries)
@@ -101,11 +110,15 @@ public sealed class FinShokoPathDataSource : IVirtualTreeDataSource
                         {
                             if (crossRef.ShokoSeries is null || crossRef.ShokoEpisode is null)
                                 continue;
-                            if (!bySeries.ContainsKey(crossRef.ShokoSeries.ID))
+
+                            // Convert MetadataGuid -> int safely
+                            if (!crossRef.ShokoSeries.ID.TryGetNumericID<int>(out var crossRefSeriesId))
+                                continue;
+                            if (!bySeries.ContainsKey(crossRefSeriesId))
                                 continue;
 
                             var identity = new FinRawFileCrossReference(
-                                crossRef.ShokoSeries.ID,
+                                crossRefSeriesId,
                                 crossRef.AnidbEpisodeID,
                                 AllEpisodesHaveShokoId: true);
                             if (!entry.CrossRefs.Any(existing =>
@@ -130,7 +143,10 @@ public sealed class FinShokoPathDataSource : IVirtualTreeDataSource
     {
         var bySeries = new Dictionary<int, IShokoSeries>();
         foreach (var series in _metadataService.GetAllShokoSeries() ?? Array.Empty<IShokoSeries>())
-            bySeries[series.ID] = series;
+        {
+            if (series.ID.TryGetNumericID<int>(out var sid))
+                bySeries[sid] = series;
+        }
 
         // Group admitted files by series so each series runs its own ordering pass.
         var admittedBySeries = admitted
@@ -148,12 +164,13 @@ public sealed class FinShokoPathDataSource : IVirtualTreeDataSource
             foreach (var file in seriesFiles)
             {
                 var (episode, video) = FindEpisodeAndVideo(series, file.FileId);
-                var placed = episode is not null && placements.TryGetValue(episode.ID, out var p)
+                var placed = episode is not null && episode.ID.TryGetNumericID<int>(out var episodeId)
+                    && placements.TryGetValue(episodeId, out var p)
                     ? p
                     : new FinPlacedEpisode(file.FileId, 1, 0, IsSpecial: false, IsExtra: false, IsAlternate: false);
 
                 var episodeInput = new FinEpisodeProjectionInput(
-                    SeasonId: series.ID,
+                    SeasonId: seriesId,
                     EpisodeId: file.FileId,
                     EpisodeNumber: placed.EpisodeNumber,
                     SeasonNumber: placed.SeasonNumber,
@@ -166,7 +183,8 @@ public sealed class FinShokoPathDataSource : IVirtualTreeDataSource
                 var show = new FinShowProjectionInput(
                     ShowId: seriesId,
                     DefaultAniDbTitle: series.AnidbAnime?.Title,
-                    DefaultTmdbTitle: series.TmdbShows?.FirstOrDefault()?.Title,
+                    DefaultTmdbTitle: (series.LinkedSeries ?? [])
+                        .FirstOrDefault(s => s.Source == MetadataSource.TMDB && s.EntityType == MetadataEntityType.Series)?.Title,
                     EpisodePadding: 3);
 
                 inputs.Add(new FinProjectionInput(
@@ -206,7 +224,7 @@ public sealed class FinShokoPathDataSource : IVirtualTreeDataSource
         {
             orderingEpisodes.Add(new FinOrderingEpisode(
                 SeasonId: seasonId,
-                EpisodeId: episode.ID,
+                EpisodeId: episode.ID.TryGetNumericID<int>(out var episodeId) ? episodeId : 0,
                 Type: ToFinEpisodeType(episode.Type),
                 AniDbEpisodeNumber: episode.AnidbEpisode?.EpisodeNumber ?? episode.EpisodeNumber,
                 AiredAt: ToAiredAt(episode),
@@ -246,7 +264,8 @@ public sealed class FinShokoPathDataSource : IVirtualTreeDataSource
         // mirroring canonical season.EpisodeList.Where(e => e.IsAvailable).
         var availableEpisodeIds = (series.Episodes ?? Array.Empty<IShokoEpisode>())
             .Where(e => e.Type == EpisodeType.Episode && !e.IsHidden)
-            .Select(e => e.ID)
+            .Select(e => e.ID.TryGetNumericID<int>(out var episodeId) ? episodeId : 0)
+            .Where(episodeId => episodeId != 0)
             .ToArray();
 
         return (placements, result.SeriesType, availableEpisodeIds);

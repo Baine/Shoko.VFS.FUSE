@@ -1,8 +1,8 @@
 using Shoko.Abstractions.Metadata.Anidb;
+using Shoko.Abstractions.Metadata;
 using Shoko.Abstractions.Metadata.Enums;
 using Shoko.Abstractions.Metadata.Services;
 using Shoko.Abstractions.Metadata.Shoko;
-using Shoko.Abstractions.Metadata.Tmdb;
 using Shoko.Abstractions.Video;
 using Shoko.Abstractions.Video.Media;
 using Shoko.Abstractions.Video.Release;
@@ -74,6 +74,27 @@ public sealed class FinShokoPathDataSourceTests
     }
 
     [Fact]
+    public void SeriesWithoutAnidbAnime_FallsBackToTmdbShowTitle()
+    {
+        var root = NewDirectory();
+        try
+        {
+            WriteFile(root, "folder/ep.mkv");
+            var series = Series(10, AnimeType.TV, anidbTitle: null, tmdbTitle: "TMDB Show",
+                Episode(30, anidbEpisodeId: 1, number: 1, fileId: 99, "folder/ep.mkv"));
+
+            var entries = Build(series, root).GetEntries();
+
+            var symlink = entries.Single(entry => entry.NodeType == VirtualNodeType.Symlink);
+            Assert.Contains("/TMDB Show [Shoko Series=10]/", symlink.Path, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(root);
+        }
+    }
+
+    [Fact]
     public void NoManagedFiles_ReturnsEmpty()
     {
         var root = NewDirectory();
@@ -136,20 +157,32 @@ public sealed class FinShokoPathDataSourceTests
             ("GetAllShokoSeries", (IEnumerable<IShokoSeries>)series)
         );
 
-    private static IShokoSeries Series(int id, AnimeType type, string title, params EpisodeSpec[] specs)
+    private static IShokoSeries Series(int id, AnimeType type, string? anidbTitle, params EpisodeSpec[] specs)
+        => Series(id, type, anidbTitle, null, specs);
+
+    private static IShokoSeries Series(int id, AnimeType type, string? anidbTitle, string? tmdbTitle, params EpisodeSpec[] specs)
     {
         var episodes = specs.Select(spec => Episode(id, spec)).ToArray();
         return Proxy<IShokoSeries>(
             ("get_ID", id),
             ("get_Type", type),
-            ("get_Title", title),
+            ("get_Title", anidbTitle),
             ("get_AnidbAnimeID", id),
             ("get_CreatedAt", new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc)),
-            ("get_AnidbAnime", AnidbAnime(id, title)),
-            ("get_TmdbShows", (IReadOnlyList<ITmdbShow>)Array.Empty<ITmdbShow>()),
+            ("get_AnidbAnime", anidbTitle is null ? null : AnidbAnime(id, anidbTitle)),
+            ("get_LinkedSeries", (IReadOnlyList<ISeries>)(tmdbTitle is null
+                ? Array.Empty<ISeries>()
+                : new ISeries[] { TmdbShow(id, tmdbTitle) })),
             ("get_Episodes", (IReadOnlyList<IShokoEpisode>)episodes)
         );
     }
+
+    private static ISeries TmdbShow(int id, string title) =>
+        Proxy<ISeries>(
+            ("get_ID", MetadataGuid.For("tmdb", "series", id.ToString())),
+            ("get_Source", MetadataSource.TMDB),
+            ("get_EntityType", MetadataEntityType.Series),
+            ("get_Title", title));
 
     private static IAnidbAnime AnidbAnime(int id, string title) =>
         Proxy<IAnidbAnime>(
@@ -260,7 +293,9 @@ public sealed class FinShokoPathDataSourceTests
             if (targetMethod is null)
                 throw new InvalidOperationException("Missing proxy method.");
             if (Members.TryGetValue(targetMethod.Name, out var value))
-                return value;
+                return value is int id && targetMethod.ReturnType == typeof(MetadataGuid)
+                    ? MetadataGuid.For("shoko", "series", id.ToString())
+                    : value;
             throw new InvalidOperationException($"Unexpected member read: {targetMethod.DeclaringType?.Name}.{targetMethod.Name}");
         }
     }

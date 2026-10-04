@@ -26,6 +26,7 @@ namespace Shoko.VFS.FUSE.Tests.Support;
 /// </summary>
 public static class OnePieceFixture
 {
+    private static readonly TimeSpan LiveRequestTimeout = TimeSpan.FromSeconds(15);
     private static readonly SemaphoreSlim Gate = new(1, 1);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -37,6 +38,18 @@ public static class OnePieceFixture
     {
         public int Total { get; set; }
         public System.Text.Json.JsonElement List { get; set; }
+    }
+
+    public static bool CanRunDiagnostic(string dataDir, string opEpsPath)
+    {
+        if (File.Exists(Path.Combine(dataDir, "managed_folders.json"))
+            && File.Exists(Path.Combine(dataDir, "gerdub_files.json"))
+            && File.Exists(Path.Combine(dataDir, "all_series.json"))
+            && File.Exists(Path.Combine(dataDir, "series_episodes.json"))
+            && File.Exists(opEpsPath))
+            return true;
+
+        return Environment.GetEnvironmentVariable("SHOKO_RUN_LIVE_DIAGNOSTICS") == "1";
     }
 
     /// <summary>Records <paramref name="dataDir"/> (and the op_eps.json copy) if not present. Thread-safe.</summary>
@@ -57,7 +70,7 @@ public static class OnePieceFixture
                 return;
 
             var (baseUrl, apiKey) = ResolveCredentials();
-            using var http = new HttpClient { BaseAddress = new Uri(baseUrl), Timeout = TimeSpan.FromMinutes(10) };
+            using var http = new HttpClient { BaseAddress = new Uri(baseUrl), Timeout = LiveRequestTimeout };
             http.DefaultRequestHeaders.Add("apikey", apiKey);
 
             Directory.CreateDirectory(dataDir);

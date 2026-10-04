@@ -143,7 +143,10 @@ public sealed class OnePieceEndToEndDiagnostic
     {
         var dataDir = Environment.GetEnvironmentVariable("ONE_PIECE_TEST_DATA")
             ?? "/tmp/opencode/onepiece_test_data";
-        await OnePieceFixture.EnsureRecordedAsync(dataDir, Path.Combine(dataDir, "op_eps.json")).ConfigureAwait(false);
+        var opEpsPath = Path.Combine(dataDir, "op_eps.json");
+        if (!OnePieceFixture.CanRunDiagnostic(dataDir, opEpsPath))
+            return;
+        await OnePieceFixture.EnsureRecordedAsync(dataDir, opEpsPath).ConfigureAwait(false);
         Assert.True(Directory.Exists(dataDir), $"Test data not found at {dataDir}");
 
         var handler = new MockHttpHandler(dataDir);

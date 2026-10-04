@@ -13,6 +13,9 @@ public sealed class FuseConnectionProbeTests
     [Fact]
     public async Task DelayedProbeWithinDeadlineUsesOneProbe()
     {
+        if (!OperatingSystem.IsLinux())
+            return; // skip: requires Linux for platform check
+
         int probeCount = 0;
 
         await FuseMountService.WaitForConnectionAsync(
@@ -36,6 +39,9 @@ public sealed class FuseConnectionProbeTests
     [Fact]
     public async Task NeverCompletingProbeTimesOutWithoutRetry()
     {
+        if (!OperatingSystem.IsLinux())
+            return; // skip: requires Linux for platform check
+
         int probeCount = 0;
         var pending = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -61,6 +67,9 @@ public sealed class FuseConnectionProbeTests
     [Fact]
     public async Task FastFalseProbeRetriesAndThenSucceeds()
     {
+        if (!OperatingSystem.IsLinux())
+            return; // skip: requires Linux for platform check
+
         int probeCount = 0;
 
         await FuseMountService.WaitForConnectionAsync(
@@ -79,6 +88,9 @@ public sealed class FuseConnectionProbeTests
     [Fact]
     public async Task CancellationStopsAwaitWithoutLaunchingAnotherProbe()
     {
+        if (!OperatingSystem.IsLinux())
+            return; // skip: requires Linux for platform check
+
         int probeCount = 0;
         using var cancellation = new CancellationTokenSource();
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

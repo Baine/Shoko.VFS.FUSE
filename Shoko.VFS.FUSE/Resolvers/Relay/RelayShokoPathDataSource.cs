@@ -236,7 +236,9 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
             }
 
             var closedSeries = FilterClosedSeries(allSeries, seedIds);
-            var byId = closedSeries.ToDictionary(series => series.ID);
+            var byId = closedSeries
+                .Where(series => series.ID.TryGetNumericID<int>(out _))
+                .ToDictionary(series => NumericId(series.ID));
             var shellInputs = closedSeries
                 .Select(series => BuildGroupingInput(ExtractSeriesShell(series)))
                 .ToList();
@@ -364,11 +366,12 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
                         continue;
                     }
 
-                    if (video is null || !seenVideos.Add(video.ID))
+                    if (video is null || !video.ID.TryGetNumericID<int>(out var videoId) || !seenVideos.Add(videoId))
                         continue;
 
                     foreach (var series in video.Series ?? Array.Empty<IShokoSeries>())
-                        ids.Add(series.ID);
+                        if (series.ID.TryGetNumericID<int>(out var seriesId))
+                            ids.Add(seriesId);
                 }
 
                 if (ids.Count > 0)
@@ -388,7 +391,7 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
                 .Any(episode => (episode.Videos ?? Array.Empty<IVideo>())
                     .Any(video => (video.Files ?? Array.Empty<IVideoFile>())
                         .Any(file => file.ManagedFolderID == _managedFolderId))))
-            .Select(series => series.ID)
+            .Select(series => NumericId(series.ID))
             .ToHashSet();
 
     private List<IShokoSeries> FilterClosedSeries(IReadOnlyList<IShokoSeries> allSeries, HashSet<int> localSeedIds)
@@ -397,10 +400,12 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
         var manualOverrides = enforceTmdbNumbering ? _options.ManualOverrideGroups : [];
         var groupingMetadata = allSeries
             .Select(series => new RelaySeriesGroupingMetadata(
-                series.ID,
+                NumericId(series.ID),
                 series.AnidbAnimeID,
                 _options.MergeTmdbSeries ? series.AirDate : null,
-                _options.MergeTmdbSeries ? (series.TmdbShows ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbShow>()).FirstOrDefault()?.ID : null
+                _options.MergeTmdbSeries
+                    ? TryGetFirstTmdbSeriesId(series)
+                    : null
             ))
             .ToArray();
         var groupClosure = RelaySeriesGrouper.GetGroupClosure(
@@ -410,7 +415,7 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
             manualOverrides
         );
         return allSeries
-            .Where(series => groupClosure.Contains(series.ID))
+            .Where(series => groupClosure.Contains(NumericId(series.ID)))
             .ToList();
     }
 
@@ -472,8 +477,9 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
     private RelayRawSeries ExtractSeries(IShokoSeries series)
     {
         bool enforceTmdbNumbering = _options.TmdbEpNumbering || _options.MergeTmdbSeries;
-        var preferredOrdering = (series.TmdbShows ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbShow>()).FirstOrDefault()?.PreferredOrdering;
-        string? rawPreferredOrderingId = preferredOrdering?.OrderingID;
+        string? rawPreferredOrderingId = _options.TmdbEpNumbering || _options.MergeTmdbSeries
+            ? GetPreferredTmdbOrderingId(series)
+            : null;
         string displayTitle = ResolveSeriesTitle(series);
         var videos = new Dictionary<int, RelayRawVideo>();
         var episodes = new List<RelayRawEpisode>();
@@ -485,13 +491,14 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
             var episodeVideos = new List<RelayRawVideo>();
             foreach (var video in episode.Videos ?? Array.Empty<IVideo>())
             {
-                if (!videos.TryGetValue(video.ID, out var rawVideo))
+                int videoId = NumericId(video.ID);
+                if (!videos.TryGetValue(videoId, out var rawVideo))
                 {
                     // Main/extra is decided by the episode first processed for this video id
                     // (the series-level cache shares one extraction across xrefs, mirroring
                     // the projector's single primary-driven mapping per video).
                     rawVideo = ExtractVideo(video, episode.Type == EpisodeType.Episode);
-                    videos.Add(video.ID, rawVideo);
+                    videos.Add(videoId, rawVideo);
                 }
                 // Upstream keeps location-excluded videos in the mapping inputs — they count
                 // toward the part/dup split (MapHelper) — and hides them only at link time
@@ -502,7 +509,7 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
 
             episodes.Add(
                 new RelayRawEpisode(
-                    episode.ID,
+                    NumericId(episode.ID),
                     episode.Type,
                     episode.EpisodeNumber,
                     episode.SeasonNumber,
@@ -513,7 +520,7 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
             );
             episodes[^1] = episodes[^1] with
             {
-                TmdbEpisodes = ExtractTmdbEpisodes(episode, enforceTmdbNumbering && !string.IsNullOrWhiteSpace(rawPreferredOrderingId))
+            TmdbEpisodes = ExtractTmdbEpisodes(episode, enforceTmdbNumbering && !string.IsNullOrWhiteSpace(rawPreferredOrderingId))
             };
         }
 
@@ -529,25 +536,90 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
     private RelayRawSeries BuildSeriesModel(IShokoSeries series, string displayTitle, List<RelayRawEpisode> episodes)
     {
         bool enforceTmdbNumbering = _options.TmdbEpNumbering || _options.MergeTmdbSeries;
-        var tmdbShows = series.TmdbShows ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbShow>();
+        var tmdbShows = TryGetTmdbSeries(series);
         var preferredOrdering = tmdbShows.FirstOrDefault()?.PreferredOrdering;
-        string? rawPreferredOrderingId = preferredOrdering?.OrderingID;
+        string? rawPreferredOrderingId = GetPreferredTmdbOrderingId(series);
         string? preferredOrderingId = rawPreferredOrderingId;
-        if (tmdbShows.FirstOrDefault() is { } tmdbShow
-            && string.Equals(preferredOrderingId, tmdbShow.ID.ToString(), StringComparison.OrdinalIgnoreCase))
-            preferredOrderingId = null;
-        var tmdbMovies = series.TmdbMovies ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbMovie>();
+        if (preferredOrdering is not null && preferredOrdering.ID.TryGetNumericID<int>(out var orderingNumericId))
+            preferredOrderingId = orderingNumericId.ToString();
+        if (preferredOrderingId?.Contains("://", StringComparison.Ordinal) == true
+            || preferredOrderingId?.Contains("//", StringComparison.Ordinal) == true)
+            preferredOrderingId = preferredOrderingId[(preferredOrderingId.LastIndexOf('/') + 1)..];
+        Shoko.Abstractions.Metadata.IMovie[] tmdbMovies;
+        try
+        {
+            tmdbMovies = (series.LinkedMovies ?? [])
+                .Where(m => m.ID.Source == MetadataSource.TMDB && m.ID.EntityType == MetadataEntityType.Movie)
+                .ToArray();
+        }
+        catch (InvalidOperationException)
+        {
+            tmdbMovies = [];
+        }
 
-        return new RelayRawSeries(series.ID, series.Type, displayTitle, episodes)
+        int? tmdbSeriesId = null;
+        foreach (var tmdbShow in tmdbShows)
+        {
+            if (tmdbShow.ID.TryGetNumericID<int>(out var tmdbSeriesNumericId))
+            {
+                tmdbSeriesId = tmdbSeriesNumericId;
+                break;
+            }
+        }
+
+        return new RelayRawSeries(NumericId(series.ID), series.Type, displayTitle, episodes)
         {
             UseTmdbNumbering = enforceTmdbNumbering,
-            IsTmdbMovie = enforceTmdbNumbering ? tmdbMovies.Any() : series.Type == AnimeType.Movie,
+            IsTmdbMovie = tmdbMovies.Length > 0 || series.Type == AnimeType.Movie,
             PreferredTmdbOrderingId = preferredOrderingId,
             RawPreferredTmdbOrderingId = rawPreferredOrderingId,
             AnidbAnimeId = series.AnidbAnimeID,
             AirDate = _options.MergeTmdbSeries ? series.AirDate : null,
-            TmdbSeriesId = _options.MergeTmdbSeries ? tmdbShows.FirstOrDefault()?.ID : null,
+            TmdbSeriesId = tmdbSeriesId,
         };
+    }
+
+    private static string? GetPreferredTmdbOrderingId(IShokoSeries series)
+    {
+        var ordering = TryGetTmdbSeries(series).FirstOrDefault()?.PreferredOrdering;
+        if (ordering is null)
+            return null;
+
+        string value = ordering.ID.ToString();
+        int separator = value.LastIndexOf('/');
+        return separator >= 0 ? value[(separator + 1)..] : value;
+    }
+
+    private static IReadOnlyList<ISeries> TryGetTmdbSeries(IShokoSeries series)
+    {
+        try
+        {
+            return (series.LinkedSeries ?? [])
+                .Where(s => s.Source == MetadataSource.TMDB && s.EntityType == MetadataEntityType.Series)
+                .ToArray();
+        }
+        catch (InvalidOperationException)
+        {
+            return [];
+        }
+    }
+
+    private static int? TryGetFirstTmdbSeriesId(IShokoSeries series)
+    {
+        try
+        {
+            foreach (var linked in series.LinkedSeries ?? [])
+            {
+                if (linked.ID.Source == MetadataSource.TMDB && linked.ID.EntityType == MetadataEntityType.Series
+                    && linked.ID.TryGetNumericID<int>(out var id))
+                    return id;
+            }
+        }
+        catch (InvalidOperationException)
+        {
+        }
+
+        return null;
     }
 
     private RelayRawVideo ExtractVideo(IVideo video, bool isMainEpisode)
@@ -566,10 +638,12 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
         // regardless of eligibility (MapHelper.cs:167-170).
         var sortPath = NormalizeForSort(locations.FirstOrDefault()?.RelativePath);
         var crossReferences = (video.CrossReferences ?? Array.Empty<IVideoCrossReference>())
-            .Select(reference => new RelayRawCrossReference(reference.ShokoEpisode?.ID, reference.ShokoEpisode?.SeriesID))
+            .Select(reference => new RelayRawCrossReference(
+                reference.ShokoEpisode?.ID.TryGetNumericID<int>(out var episodeId) == true ? episodeId : null,
+                reference.ShokoEpisode?.SeriesID.TryGetNumericID<int>(out var seriesId) == true ? seriesId : null))
             .ToArray();
 
-        return new RelayRawVideo(video.ID, video.IsVariation, sortPath, source?.AbsolutePath, source?.Size ?? selected?.Size ?? 0, source?.Extension ?? selected?.Extension ?? "", crossReferences)
+        return new RelayRawVideo(NumericId(video.ID), video.IsVariation, sortPath, source?.AbsolutePath, source?.Size ?? selected?.Size ?? 0, source?.Extension ?? selected?.Extension ?? "", crossReferences)
         {
             IsExcluded = excluded,
         };
@@ -730,20 +804,50 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
 
     private static string NormalizeForSort(string? path) => NormalizeSeparators(path ?? "");
 
-    private IReadOnlyList<RelayRawTmdbEpisode> ExtractTmdbEpisodes(IShokoEpisode episode, bool loadAlternateOrderings) =>
-        (episode.TmdbEpisodes ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbEpisode>())
-            .Select(tmdb => new RelayRawTmdbEpisode(
-                tmdb.SeasonNumber,
-                tmdb.EpisodeNumber,
-                tmdb.OrderingID,
-                loadAlternateOrderings
-                    ? (tmdb.AllOrderings ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbEpisodeOrderingInformation>())
-                        .Select(ordering => new RelayRawTmdbOrdering(ordering.OrderingID, ordering.SeasonNumber, ordering.EpisodeNumber))
-                        .ToArray()
-                    : Array.Empty<RelayRawTmdbOrdering>(),
-                tmdb.PreferredTitle?.Value
+    private static int NumericId(MetadataGuid id) =>
+        id.TryGetNumericID<int>(out var value)
+            ? value
+            : throw new InvalidOperationException($"Metadata ID '{id}' is not numeric.");
+
+    private IReadOnlyList<RelayRawTmdbEpisode> ExtractTmdbEpisodes(IShokoEpisode episode, bool loadAlternateOrderings)
+    {
+        IReadOnlyList<IEpisode> tmdbEpisodes;
+        try
+        {
+            tmdbEpisodes = (episode.LinkedEpisodes ?? [])
+                .Where(e => e.Source == MetadataSource.TMDB && e.EntityType == MetadataEntityType.Episode)
+                .ToArray();
+        }
+        catch (InvalidOperationException)
+        {
+            return [];
+        }
+
+        return tmdbEpisodes
+            .Select(tmdbEpisode => new RelayRawTmdbEpisode(
+                tmdbEpisode.PreferredOrdering?.SeasonNumber ?? tmdbEpisode.SeasonNumber,
+                tmdbEpisode.PreferredOrdering?.EpisodeNumber ?? tmdbEpisode.EpisodeNumber,
+                SliceTmdbId(tmdbEpisode.PreferredOrdering?.OrderingID.ToString()),
+                !loadAlternateOrderings
+                    ? []
+                    : tmdbEpisode.Orderings.Select(ordering => new RelayRawTmdbOrdering(
+                        SliceTmdbId(ordering.OrderingID.ToString()),
+                        ordering.SeasonNumber ?? 0,
+                        ordering.EpisodeNumber
+                    )).ToArray(),
+                tmdbEpisode.PreferredTitle?.Value
             ))
             .ToArray();
+    }
+
+    private static string SliceTmdbId(string? id)
+    {
+        if (string.IsNullOrEmpty(id))
+            return "";
+        if (id.Contains("://", StringComparison.Ordinal))
+            return id[(id.LastIndexOf('/') + 1)..];
+        return id;
+    }
 
     private string ResolveSeriesTitle(IShokoSeries series)
     {
@@ -756,14 +860,17 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
     private string ResolveEpisodeTitle(IShokoEpisode episode, IShokoSeries series, string displaySeriesTitle)
     {
         string raw = GetTitleByLanguage(episode, _options.EpisodeTitleLanguage);
-        var tmdbEpisodes = episode.TmdbEpisodes ?? Array.Empty<Shoko.Abstractions.Metadata.Tmdb.ITmdbEpisode>();
-        string? tmdbTitle = tmdbEpisodes.FirstOrDefault()?.PreferredTitle?.Value;
+        string? tmdbTitle = TryGetTmdbEpisodeTitle(episode);
 
-        if (episode.EpisodeNumber == 1 && s_ambiguousTitles.Contains(raw))
+        if (s_ambiguousTitles.Contains(raw) || s_defaultTitleRegex.IsMatch(raw) || (raw.Equals("Trailer", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(tmdbTitle)))
         {
             string title = displaySeriesTitle;
-            if (title == raw)
+            if (title == raw || s_defaultTitleRegex.IsMatch(raw))
                 title = tmdbTitle ?? GetTitleByLanguage(series, "en");
+            if (!string.IsNullOrWhiteSpace(tmdbTitle) && s_defaultTitleRegex.IsMatch(raw))
+                return tmdbTitle;
+            if (!string.IsNullOrWhiteSpace(tmdbTitle) && raw.Equals("Trailer", StringComparison.OrdinalIgnoreCase))
+                return tmdbTitle;
             if (title != raw && !title.Contains(raw, StringComparison.Ordinal))
             {
                 string result = raw == "Complete Movie" ? s_movieDescriptorRegex.Replace(title, "").Trim() : title;
@@ -772,12 +879,24 @@ public sealed class RelayShokoPathDataSource : IShokoPathDataSource, ILazyShokoP
             return title;
         }
 
-        if (_options.TmdbEpGroupNames && tmdbEpisodes.Count > 1 && !string.IsNullOrEmpty(tmdbTitle))
-            return tmdbTitle;
-
         return !string.IsNullOrEmpty(tmdbTitle) && s_defaultTitleRegex.IsMatch(raw) && !s_defaultTitleRegex.IsMatch(tmdbTitle)
             ? tmdbTitle
             : raw;
+    }
+
+    private static string? TryGetTmdbEpisodeTitle(IShokoEpisode episode)
+    {
+        try
+        {
+            return (episode.LinkedEpisodes ?? [])
+                .Where(e => e.Source == MetadataSource.TMDB && e.EntityType == MetadataEntityType.Episode)
+                .Select(tmdbEpisode => tmdbEpisode.PreferredTitle?.Value)
+                .FirstOrDefault(title => !string.IsNullOrWhiteSpace(title));
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
     }
 
     private static string GetTitleByLanguage(IWithTitles? item, string languageSetting)
