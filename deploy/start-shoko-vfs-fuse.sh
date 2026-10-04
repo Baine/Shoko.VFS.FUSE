@@ -46,7 +46,7 @@
 
 set -eu
 
-VERSION="2.1.1"
+VERSION="2.2.0"
 
 SCRIPT_DIR=$(
     CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null
